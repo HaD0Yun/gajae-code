@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Ralplan can publish validated run-scoped execution DAG sidecars, Team now supports an SDK/Broker-backed headless control plane and read-only watch output, and opted-in Ultragoal runs can launch, join, reap, and checkpoint approved parallel lanes while preserving tmux defaults and leader-only durable goal authority.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

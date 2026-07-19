@@ -666,7 +666,8 @@ setInterval(()=>{},1000);
 		expect(JSON.stringify(listed.result)).toContain('"terminalUncertain":true');
 	} finally {
 		await broker.stop();
-		process.env.GJC_SDK_SESSION_COMMAND = previous;
+		if (previous === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previous;
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 }, 15_000);
@@ -1661,14 +1662,14 @@ test("session-host-internal exits with a sanitized startup failure before writin
 test("production lifecycle factory failure preserves reason and redacts collected secrets", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-factory-failure-"));
 	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
 	const names = ["GJC_SDK_TEST_FACTORY_FAILURE", "GJC_SDK_TEST_FACTORY_SECRET"] as const;
 	const previous = names.map(name => process.env[name]);
 	const bare = "factory-bare-secret";
 	const overlap = `${bare}-overlap`;
 	const normalized = "factory-secret０".normalize("NFKC");
-	process.env.GJC_SDK_TEST_FACTORY_FAILURE = root;
+	process.env.GJC_SDK_TEST_FACTORY_FAILURE = await fs.realpath(root);
 	process.env.GJC_SDK_TEST_FACTORY_SECRET = `${overlap} ${normalized} ${"x".repeat(600)}`;
+	const broker = new Broker({ agentDir });
 	try {
 		await broker.start();
 		const response = await broker.handleRequest(
@@ -1700,9 +1701,9 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 test("never-settling model profile startup cuts off with proven pre-registration cleanup", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-cutoff-"));
 	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
 	const previous = process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE;
-	process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = root;
+	process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = await fs.realpath(root);
+	const broker = new Broker({ agentDir });
 	try {
 		await broker.start();
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
@@ -1738,9 +1739,9 @@ test("never-settling model profile startup cuts off with proven pre-registration
 test("production post-registration startup failure proves cleanup and exact replay", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
 	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
 	const previousFailure = process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
-	process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = root;
+	process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = await fs.realpath(root);
+	const broker = new Broker({ agentDir });
 	try {
 		await broker.start();
 		const input = { cwd: root, readinessTimeoutMs: 10_000 };

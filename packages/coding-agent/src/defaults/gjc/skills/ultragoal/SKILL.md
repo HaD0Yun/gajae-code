@@ -217,13 +217,17 @@ For failed, timed-out, or contract-violating slices, record durable ledger evide
 
 ### Runtime-backed pipelined scheduling
 
-Sequential execution remains the default. Ultragoal may use runtime-backed pipelined scheduling only when `goals.json` metadata proves original-plan independence and disjoint target files/surfaces for the prior and next goals. This is a leader-owned Ultragoal runtime contract, not hidden Team scheduling and not a substitute for the native executor parallelism contract above.
+Sequential execution remains the default. Ultragoal may use runtime-backed pipelined scheduling only when `goals.json` metadata proves original-plan independence and disjoint target files/surfaces for the prior and next goals. This is leader-owned scheduling and is not a transfer of Team or checkpoint ownership.
 
 Pipeline metadata is explicit-only: create eligible goals with `gjc ultragoal create-goals --goal-metadata-json '<json>'` or the equivalent runtime `createUltragoalPlan({ goalMetadata })` input. Brief-only or missing metadata remains valid but non-eligible and falls back to ordinary sequential scheduling. The initial pipeline contract is **aggregate mode only**; per-story mode remains sequential until a separate UX/state contract exists.
 
 The full lifecycle commands (`start-pipeline-overlap`, `join-pipeline-overlap`, `rebaseline-pipeline-overlap`) and the fail-closed overlap rules — at most one eligible next goal per join window, G(N) remains active until a clean join, quarantine and re-baseline on dirty joins or lost handles, complete checkpoints fail closed on open overlaps or unattributable change-set paths — are specified in the internal `pipeline-validation-contracts` fragment (`skill-fragments/ultragoal/pipeline-validation-contracts.md`). Load that fragment before operating an overlap; the runtime enforces its rules verbatim.
 
-Team remains explicit and separate: Team is not auto-launched, not a hidden pipeline scheduler, and never owns Ultragoal goals, checkpoints, or ledger state.
+`GJC_ULTRAGOAL_PARALLEL` is the explicit opt-in for the shipped automatic parallel launch path. When enabled for an approved run-scoped execution plan and `GJC_TEAM_BACKEND` is unset or explicitly `headless`, the Ultragoal leader may launch SDK-backed headless Team lanes, publish the run-scoped execution sidecar, and watch their durable state. Explicit `GJC_TEAM_BACKEND=tmux` preserves manual Team handoff and never forces headless. Automatic means launch-and-join, not fire-and-forget: every launched lane must reach an authoritative terminal state and join before integration, review, or checkpoint. Unknown, failed, stale-unverified, or unjoined workers fail closed; force recovery applies only to a delegate authoritatively proven stale.
+
+Team remains independent: it is not a hidden pipeline scheduler and never owns Ultragoal goals, checkpoints, ledger state, integration, assignment changes, or final lifecycle decisions. The Ultragoal leader is the sole owner. The execution sidecar identifies the current run and its lanes; it is publication metadata, not an ownership or claim record.
+Outside the explicit `GJC_ULTRAGOAL_PARALLEL` opt-in, Ultragoal does not auto-launch Team.
+Outside that explicit opt-in, Team is not auto-launched and Ultragoal performs no hidden goal mutation.
 
 ## Validation batches (aggregate-only)
 
@@ -248,7 +252,7 @@ Within a single goal (including a single-goal run or one validation-batch member
 
 ## Use Ultragoal and Team together
 
-Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
+Use Ultragoal and Team together for a durable Ultragoal story that benefits from coordinated workers. The default Team backend remains visible tmux execution. With the explicit `GJC_ULTRAGOAL_PARALLEL` opt-in and `GJC_TEAM_BACKEND` unset or `headless`, the leader may instead use the shipped headless SDK/broker backend for eligible execution-plan lanes. Explicit `GJC_TEAM_BACKEND=tmux` preserves manual Team handoff. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team returns task/evidence status to the leader.
 
 The leader checkpoints Ultragoal from Team evidence plus the current-session GJC goal snapshot; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
 
@@ -256,7 +260,7 @@ The leader checkpoints Ultragoal from Team evidence plus the current-session GJC
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>
 ```
 
-Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
+Workers do not own Ultragoal goal state, create worker Ultragoal ledgers, checkpoint Ultragoal, integrate changes, or make assignment/lifecycle decisions. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after all launched Team lanes are terminal and joined. Team remains an independent workflow even when the leader selects the explicit automatic headless launch path; no worker performs hidden goal mutation.
 
 ## Internal Ultragoal sub-skill fragments
 

@@ -392,6 +392,30 @@ describe("native gjc team runtime", () => {
 		});
 		expect(snapshot.worker_lifecycle_by_id["worker-1"]?.lifecycle_state).toBe("ready");
 		expect(snapshot.worker_lifecycle_by_id["worker-1"]?.worker_status_state).toBe("blocked");
+		const lifecyclePath = path.join(
+			teamStateDir(cleanupRoot, "worker-lifecycle-team"),
+			"workers",
+			"worker-1",
+			"lifecycle.json",
+		);
+		const lifecycle = (await Bun.file(lifecyclePath).json()) as Record<string, unknown>;
+		await Bun.write(
+			lifecyclePath,
+			JSON.stringify({
+				...lifecycle,
+				lifecycle_state: "unavailable",
+				stop_reason: "headless_session_unavailable",
+			}),
+		);
+		snapshot = await readGjcTeamSnapshot("worker-lifecycle-team", cleanupRoot, {
+			PATH: "",
+			GJC_SESSION_ID: TEST_SESSION_ID,
+		});
+		expect(snapshot.worker_lifecycle_by_id["worker-1"]).toMatchObject({
+			lifecycle_state: "unavailable",
+			worker_status_state: "blocked",
+			stop_reason: "headless_session_unavailable",
+		});
 		const forceRequest = (await executeGjcTeamApiOperation(
 			"write-shutdown-request",
 			{
@@ -870,6 +894,85 @@ describe("native gjc team runtime", () => {
 		expect(task2.lane).toBe("lane-b");
 		expect(task2.description).toContain("Add focused regression coverage");
 		expect(task2.description).not.toContain("Define the durable schema");
+	});
+	it("maps explicit lane dependencies to deterministic task ids and blocks claims", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: ["### Lane A — Runtime", "Implement runtime.", "", "### Lane B — Tests (after: A)", "Add tests."].join(
+				"\n",
+			),
+			teamName: "lane-dependency-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+		});
+
+		const task2 = await readGjcTeamTask("lane-dependency-team", "task-2", cleanupRoot, {
+			PATH: "",
+			GJC_SESSION_ID: TEST_SESSION_ID,
+		});
+		expect(task2.depends_on).toEqual(["task-1"]);
+		expect(
+			await claimGjcTeamTask(
+				"lane-dependency-team",
+				"worker-2",
+				cleanupRoot,
+				{ GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+				"task-2",
+			),
+		).toEqual({ ok: false, reason: "blocked_by_dependency:task-1" });
+	});
+
+	it("rejects missing, self, and cyclic explicit lane dependencies", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const launch = (teamName: string, task: string) =>
+			startGjcTeam({
+				workerCount: 2,
+				agentType: "executor",
+				task,
+				teamName,
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			});
+
+		await expect(launch("missing-lane-dependency", "### Lane A — Runtime (after: Z)\nWork.")).rejects.toThrow(
+			"invalid_lane_dependency:task-1",
+		);
+		await expect(launch("self-lane-dependency", "### Lane A — Runtime (after: A)\nWork.")).rejects.toThrow(
+			"invalid_lane_dependency:task-1",
+		);
+		await expect(
+			launch(
+				"cyclic-lane-dependency",
+				["### Lane A — Runtime (after: B)", "Work.", "### Lane B — Tests (after: A)", "Verify."].join("\n"),
+			),
+		).rejects.toThrow("lane_dependency_cycle");
+	});
+	it("rejects duplicate canonical lane labels and unsupported dependency prefix grammar", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const launch = (teamName: string, task: string) =>
+			startGjcTeam({
+				workerCount: 2,
+				agentType: "executor",
+				task,
+				teamName,
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			});
+
+		await expect(
+			launch("duplicate-lane", ["### Lane A — Runtime", "Work.", "### Lane A — Tests", "Verify."].join("\n")),
+		).rejects.toThrow("duplicate_team_lane_label:A");
+		await expect(
+			launch("case-duplicate-lane", ["### Lane A — Runtime", "Work.", "### Lane a — Tests", "Verify."].join("\n")),
+		).rejects.toThrow("duplicate_team_lane_label:a");
+		await expect(launch("prefix-dependency-lane", "### Lane A (after: B) — Runtime\nWork.")).rejects.toThrow(
+			"invalid_team_lane_heading",
+		);
 	});
 
 	it("rejects ambiguous inline lane splits before duplicating broad multi-worker work", async () => {
@@ -1992,7 +2095,7 @@ describe("native gjc team runtime", () => {
 			"task-3",
 		);
 		expect(blockedByDependency.ok).toBe(false);
-		expect(blockedByDependency.reason).toBe("task_dependency_incomplete:task-3:task-1");
+		expect(blockedByDependency.reason).toBe("blocked_by_dependency:task-1");
 
 		await executeGjcTeamApiOperation(
 			"create-task",

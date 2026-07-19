@@ -388,6 +388,270 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(pendingApproval).toBe("# Final Plan\n");
 	});
 
+	it("writes and receipts a normalized final execution-plan sidecar from inline JSON or a file", async () => {
+		for (const source of ["inline", "file"] as const) {
+			const root = await tempDir();
+			const plan = {
+				version: 1,
+				goals: [
+					{ title: "Build", execution: "parallel_group", lanes: [{ id: "A", role: "executor", after: [] }] },
+					{ title: "Check", execution: "sequential", lanes: [{ id: "B", role: "critic", after: [] }] },
+				],
+			};
+			const input = source === "inline" ? JSON.stringify(plan) : path.join(root, "source-execution-plan.json");
+			if (source === "file") await fs.writeFile(input, JSON.stringify(plan));
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"final",
+					"--stage_n",
+					"7",
+					"--artifact",
+					"# Final",
+					"--execution-plan",
+					input,
+					"--run-id",
+					`sidecar-${source}`,
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}");
+			expect(payload.execution_plan_path).toBe(ralplanPlanPath(root, `sidecar-${source}`, "execution-plan.json"));
+			expect(JSON.parse(await fs.readFile(payload.execution_plan_path, "utf8"))).toEqual(plan);
+		}
+	});
+
+	it("deduplicates identical execution-plan retries and fails closed on a conflicting sidecar", async () => {
+		const root = await tempDir();
+		const base = [
+			"--write",
+			"--stage",
+			"final",
+			"--stage_n",
+			"8",
+			"--artifact",
+			"# Final",
+			"--run-id",
+			"retry",
+			"--json",
+		];
+		const plan = JSON.stringify({
+			version: 1,
+			goals: [{ title: "Build", execution: "sequential", lanes: [{ id: "A", role: "architect", after: [] }] }],
+		});
+		const first = await runNativeRalplanCommand([...base, "--execution-plan", plan], root);
+		const retry = await runNativeRalplanCommand([...base, "--execution-plan", plan], root);
+		expect(first.status).toBe(0);
+		expect(JSON.parse(retry.stdout ?? "{}")).toMatchObject({
+			deduplicated: true,
+			execution_plan_path: ralplanPlanPath(root, "retry", "execution-plan.json"),
+		});
+
+		const conflicting = JSON.stringify({
+			version: 1,
+			goals: [{ title: "Changed", execution: "sequential", lanes: [{ id: "A", role: "planner", after: [] }] }],
+		});
+		const conflict = await runNativeRalplanCommand([...base, "--execution-plan", conflicting], root);
+		expect(conflict.status).toBe(2);
+		expect(conflict.stderr).toContain("refusing to change committed ralplan execution plan");
+		expect(JSON.parse(await fs.readFile(ralplanPlanPath(root, "retry", "execution-plan.json"), "utf8"))).toEqual(
+			JSON.parse(plan),
+		);
+	});
+
+	it("repairs missing members of an identical final publication", async () => {
+		const root = await tempDir();
+		const plan = JSON.stringify({
+			version: 1,
+			goals: [
+				{
+					title: "Ship",
+					execution: "sequential",
+					lanes: [
+						{ id: "A1", role: "executor", after: [] },
+						{ id: "B2", role: "critic", after: ["A1"] },
+					],
+				},
+			],
+		});
+		const args = [
+			"--write",
+			"--stage",
+			"final",
+			"--stage_n",
+			"9",
+			"--artifact",
+			"# Repairable",
+			"--execution-plan",
+			plan,
+			"--run-id",
+			"repair",
+			"--json",
+		];
+		expect((await runNativeRalplanCommand(args, root)).status).toBe(0);
+		const pendingPath = ralplanPlanPath(root, "repair", "pending-approval.md");
+		const sidecarPath = ralplanPlanPath(root, "repair", "execution-plan.json");
+		await fs.rm(pendingPath);
+		await fs.rm(sidecarPath);
+
+		const repaired = await runNativeRalplanCommand(args, root);
+		expect(repaired.status).toBe(0);
+		expect(await fs.readFile(pendingPath, "utf8")).toBe("# Repairable\n");
+		expect(JSON.parse(await fs.readFile(sidecarPath, "utf8"))).toEqual(JSON.parse(plan));
+	});
+
+	it("keeps execution-plan identity run-scoped across stages, revisions, retries, conflicts, and repair", async () => {
+		const root = await tempDir();
+		const run = "run-scoped-plan";
+		const plan = JSON.stringify({
+			version: 1,
+			goals: [{ title: "Bound", execution: "sequential", lanes: [] }],
+		});
+		const write = (stage: string, stageN: number, artifact: string, includePlan = false) =>
+			runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					stage,
+					"--stage_n",
+					String(stageN),
+					"--artifact",
+					artifact,
+					"--run-id",
+					run,
+					"--json",
+					...(includePlan ? ["--execution-plan", plan] : []),
+				],
+				root,
+			);
+
+		expect((await write("planner", 1, "# Planner")).status).toBe(0);
+		expect((await write("architect", 2, "# Architect")).status).toBe(0);
+		expect((await write("final", 3, "# Final", true)).status).toBe(0);
+		expect((await write("final", 4, "# Revised final")).status).toBe(0);
+		expect(await fs.readFile(ralplanPlanPath(root, run, "pending-approval.md"), "utf8")).toBe("# Revised final\n");
+
+		const retry = await write("final", 4, "# Revised final");
+		expect(retry.status).toBe(0);
+		expect(JSON.parse(retry.stdout ?? "{}").deduplicated).toBe(true);
+
+		const conflicting = JSON.stringify({
+			version: 1,
+			goals: [{ title: "Changed", execution: "sequential", lanes: [] }],
+		});
+		const conflict = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--stage_n",
+				"5",
+				"--artifact",
+				"# Conflicting final",
+				"--run-id",
+				run,
+				"--execution-plan",
+				conflicting,
+			],
+			root,
+		);
+		expect(conflict.status).toBe(2);
+		expect(conflict.stderr).toContain("refusing to change committed ralplan execution plan");
+
+		const sidecarPath = ralplanPlanPath(root, run, "execution-plan.json");
+		await fs.rm(sidecarPath);
+		const omittedRepair = await write("architect", 2, "# Architect");
+		expect(omittedRepair.status).toBe(2);
+		expect(omittedRepair.stderr).toContain("retry with --execution-plan to repair it");
+		const repaired = await write("final", 4, "# Revised final", true);
+		expect(repaired.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(sidecarPath, "utf8"))).toEqual(JSON.parse(plan));
+	});
+
+	it("rejects duplicate value flags and value flags with missing values", async () => {
+		const root = await tempDir();
+		const duplicate = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage", "critic", "--stage_n", "1", "--artifact", "x"],
+			root,
+		);
+		expect(duplicate.status).toBe(2);
+		expect(duplicate.stderr).toContain("duplicate flag: --stage");
+
+		for (const args of [
+			["--write", "--stage"],
+			["--write", "--stage", "--json"],
+			["--write", "--stage", "planner", "--stage_n", "--artifact", "x"],
+		]) {
+			const missing = await runNativeRalplanCommand(args, root);
+			expect(missing.status).toBe(2);
+			expect(missing.stderr).toContain("missing value for");
+		}
+	});
+
+	it("rejects malformed and duplicate lane identifiers and dependency references", async () => {
+		const root = await tempDir();
+		const invalidLanes = [
+			[{ id: "lane-A", role: "executor", after: [] }],
+			[
+				{ id: "A", role: "executor", after: [] },
+				{ id: "A", role: "critic", after: [] },
+			],
+			[
+				{ id: "A", role: "executor", after: [] },
+				{ id: "B", role: "critic", after: ["A-1"] },
+			],
+			[
+				{ id: "A", role: "executor", after: [] },
+				{ id: "B", role: "critic", after: ["A", "A"] },
+			],
+		];
+		for (const [index, lanes] of invalidLanes.entries()) {
+			const plan = JSON.stringify({
+				version: 1,
+				goals: [{ title: "Invalid", execution: "sequential", lanes }],
+			});
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"final",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"x",
+					"--execution-plan",
+					plan,
+					"--run-id",
+					`invalid-lanes-${index}`,
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+		}
+	});
+
+	it("rejects malformed execution plans and use outside the final stage", async () => {
+		const root = await tempDir();
+		for (const [stage, plan] of [
+			["final", "[]"],
+			["final", '{"version":1,"goals":[{"title":"x","execution":"parallel","lanes":[]}]}'],
+			[
+				"final",
+				'{"version":1,"goals":[{"title":"x","execution":"sequential","lanes":[{"id":"A","role":"unknown","after":[]}]}]}',
+			],
+			["planner", '{"version":1,"goals":[]}'],
+		] as const) {
+			const result = await runNativeRalplanCommand(
+				["--write", "--stage", stage, "--stage_n", "1", "--artifact", "x", "--execution-plan", plan],
+				root,
+			);
+			expect(result.status).toBe(2);
+		}
+	});
+
 	it("rejects unknown --stage with exit 2", async () => {
 		const root = await tempDir();
 		const result = await runNativeRalplanCommand(

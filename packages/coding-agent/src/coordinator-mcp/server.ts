@@ -2215,7 +2215,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (session.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
 			const activeTurn = await readActiveTurn(namespaceDir, id);
-			if (activeTurn) return { ok: false, reason: "active_turn", closed: false, active_turn_id: activeTurn.turn_id };
+			if (activeTurn && opts.force !== true)
+				return { ok: false, reason: "active_turn", closed: false, active_turn_id: activeTurn.turn_id };
+			if (activeTurn) {
+				const timestamp = new Date().toISOString();
+				const superseded: TurnRecord = {
+					...activeTurn,
+					status: "superseded",
+					updated_at: timestamp,
+					completed_at: timestamp,
+				};
+				await writeTurnRecord(namespaceDir, superseded);
+				await clearActiveTurn(namespaceDir, superseded);
+			}
 			const cwd = optionalString(session.cwd);
 			const persistedWorkspace = optionalString(session.broker_workspace);
 			const persistedGeneration =
@@ -2228,6 +2240,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			let workspace = "";
+			let forceClosedStaleEndpoint = false;
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
 				const authority = await exactBrokerSessionAuthority(id, workspace);
@@ -2250,24 +2263,34 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					),
 				);
 			} catch (error) {
-				return {
-					ok: false,
-					reason: "close_failed",
-					detail: error instanceof SdkClientError ? error.code : "unavailable",
-					closed: false,
-				};
-			}
-			try {
-				await exactBrokerSessionAuthority(id, workspace);
-				return { ok: false, reason: "endpoint_stale", closed: false };
-			} catch (error) {
-				if (!(error instanceof SdkClientError) || error.code !== "not_found")
+				if (
+					opts.force === true &&
+					error instanceof SdkClientError &&
+					(error.code === "endpoint_stale" || error.code === "not_found")
+				) {
+					forceClosedStaleEndpoint = true;
+				} else {
 					return {
 						ok: false,
 						reason: "close_failed",
 						detail: error instanceof SdkClientError ? error.code : "unavailable",
 						closed: false,
 					};
+				}
+			}
+			if (!forceClosedStaleEndpoint) {
+				try {
+					await exactBrokerSessionAuthority(id, workspace);
+					return { ok: false, reason: "endpoint_stale", closed: false };
+				} catch (error) {
+					if (!(error instanceof SdkClientError) || error.code !== "not_found")
+						return {
+							ok: false,
+							reason: "close_failed",
+							detail: error instanceof SdkClientError ? error.code : "unavailable",
+							closed: false,
+						};
+				}
 			}
 			await fs.rm(sessionFile(id), { force: true });
 			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });

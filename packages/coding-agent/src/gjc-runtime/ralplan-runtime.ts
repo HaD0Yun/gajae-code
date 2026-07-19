@@ -19,6 +19,7 @@ import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonlIdempotent,
 	readExistingStateForMutation,
+	withWorkflowStateLock,
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
@@ -37,7 +38,7 @@ import {
  *
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
  *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
- *    [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
+ *    [--execution-plan <json-or-path>] [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
  *    / Critic / revision / post-interview / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
  *    an `index.jsonl` audit log, copies `final` stages to `pending-approval.md`, and advances
  *    the HUD chip to reflect the latest persisted stage.
@@ -83,6 +84,7 @@ const VALUE_FLAGS = new Set([
 	"--stage_n",
 	"--artifact",
 	"--artifact-env",
+	"--execution-plan",
 	"--run-id",
 	"--session-id",
 	"--architect",
@@ -96,9 +98,24 @@ const VALUE_FLAGS = new Set([
 ]);
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
+	const positions: number[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		if (args[index] === flag) positions.push(index);
+	}
+	if (positions.length > 1) throw new RalplanCommandError(2, `duplicate flag: ${flag}`);
+	if (positions.length === 0) return undefined;
+	const value = args[positions[0] + 1];
+	if (
+		value === undefined ||
+		VALUE_FLAGS.has(value) ||
+		value === "--write" ||
+		value === "--json" ||
+		value === "--interactive" ||
+		value === "--deliberate"
+	) {
+		throw new RalplanCommandError(2, `missing value for ${flag}`);
+	}
+	return value;
 }
 
 function hasFlag(args: readonly string[], flag: string): boolean {
@@ -166,6 +183,103 @@ async function resolveArtifactContent(rawArtifact: string, cwd: string): Promise
 	return rawArtifact;
 }
 
+const EXECUTION_PLAN_ROLES = new Set(["executor", "architect", "planner", "critic"]);
+const EXECUTION_PLAN_LANE_ID_RE = /^[A-Za-z0-9]+$/;
+
+function normalizeExecutionPlan(raw: string): string {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch (error) {
+		throw new RalplanCommandError(2, `invalid --execution-plan JSON: ${(error as Error).message}`);
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new RalplanCommandError(2, "--execution-plan must be a JSON object");
+	}
+	const document = value as Record<string, unknown>;
+	if (document.version !== 1 || !Array.isArray(document.goals)) {
+		throw new RalplanCommandError(2, "--execution-plan requires version 1 and a goals array");
+	}
+	for (const [goalIndex, rawGoal] of document.goals.entries()) {
+		if (!rawGoal || typeof rawGoal !== "object" || Array.isArray(rawGoal)) {
+			throw new RalplanCommandError(2, `--execution-plan goal ${goalIndex + 1} must be an object`);
+		}
+		const goal = rawGoal as Record<string, unknown>;
+		if (typeof goal.title !== "string" || goal.title.trim() === "") {
+			throw new RalplanCommandError(2, `--execution-plan goal ${goalIndex + 1} requires a title`);
+		}
+		if (goal.execution !== "sequential" && goal.execution !== "parallel_group") {
+			throw new RalplanCommandError(2, `invalid --execution-plan execution for ${goal.title}`);
+		}
+		if (goal.lanes === undefined && goal.execution === "sequential") {
+			goal.lanes = [];
+		}
+		if (!Array.isArray(goal.lanes)) {
+			throw new RalplanCommandError(2, `--execution-plan lanes must be an array for ${goal.title}`);
+		}
+		for (const [laneIndex, rawLane] of goal.lanes.entries()) {
+			if (!rawLane || typeof rawLane !== "object" || Array.isArray(rawLane)) {
+				throw new RalplanCommandError(
+					2,
+					`--execution-plan lane ${laneIndex + 1} for ${goal.title} must be an object`,
+				);
+			}
+			const lane = rawLane as Record<string, unknown>;
+			if (
+				typeof lane.id !== "string" ||
+				!EXECUTION_PLAN_LANE_ID_RE.test(lane.id) ||
+				typeof lane.role !== "string" ||
+				!EXECUTION_PLAN_ROLES.has(lane.role) ||
+				!Array.isArray(lane.after) ||
+				lane.after.some(
+					dependency => typeof dependency !== "string" || !EXECUTION_PLAN_LANE_ID_RE.test(dependency),
+				) ||
+				new Set(lane.after).size !== lane.after.length
+			) {
+				throw new RalplanCommandError(2, `invalid --execution-plan lane ${laneIndex + 1} for ${goal.title}`);
+			}
+		}
+		const lanes = goal.lanes as Array<Record<string, unknown>>;
+		const ids = new Set(lanes.map(lane => lane.id as string));
+		if (ids.size !== lanes.length) {
+			throw new RalplanCommandError(2, `duplicate --execution-plan lane for ${goal.title}`);
+		}
+		if (goal.execution === "parallel_group" && lanes.length === 0) {
+			throw new RalplanCommandError(2, `parallel_group requires lanes for ${goal.title}`);
+		}
+		const byId = new Map(lanes.map(lane => [lane.id as string, lane]));
+		for (const lane of lanes) {
+			const id = lane.id as string;
+			if ((lane.after as string[]).some(dependency => dependency === id || !ids.has(dependency))) {
+				throw new RalplanCommandError(2, `invalid --execution-plan dependency for lane ${id}`);
+			}
+		}
+		const visiting = new Set<string>();
+		const visited = new Set<string>();
+		const visit = (id: string): void => {
+			if (visiting.has(id)) {
+				throw new RalplanCommandError(2, `--execution-plan lane dependency cycle for ${goal.title}`);
+			}
+			if (visited.has(id)) return;
+			visiting.add(id);
+			for (const dependency of (byId.get(id)?.after as string[]) ?? []) visit(dependency);
+			visiting.delete(id);
+			visited.add(id);
+		};
+		for (const id of ids) visit(id);
+	}
+	return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+async function resolveExecutionPlan(raw: string, cwd: string): Promise<string> {
+	try {
+		JSON.parse(raw);
+	} catch {
+		return normalizeExecutionPlan(await resolveArtifactContent(raw, cwd));
+	}
+	return normalizeExecutionPlan(raw);
+}
+
 /* ------------------------------ artifact write ------------------------------ */
 
 interface ResolvedArtifactArgs {
@@ -174,6 +288,7 @@ interface ResolvedArtifactArgs {
 	runId: string;
 	artifact: string;
 	sessionId: string;
+	executionPlan?: string;
 	json: boolean;
 }
 
@@ -411,6 +526,13 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const stageN = parseStageN(flagValue(args, "--stage_n"));
 
 	const rawArtifact = flagValue(args, "--artifact");
+	const rawExecutionPlan = flagValue(args, "--execution-plan");
+	if (rawExecutionPlan === "")
+		throw new RalplanCommandError(2, "--execution-plan requires a JSON object or file path");
+	if (rawExecutionPlan !== undefined && stage !== "final") {
+		throw new RalplanCommandError(2, "--execution-plan is only valid with --stage final");
+	}
+	const executionPlan = rawExecutionPlan === undefined ? undefined : await resolveExecutionPlan(rawExecutionPlan, cwd);
 	const artifactEnvName = flagValue(args, "--artifact-env");
 	const artifactSources = [rawArtifact, artifactEnvName].filter(value => value !== undefined);
 	if (artifactSources.length === 0 || artifactSources.some(value => value === "")) {
@@ -447,7 +569,15 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	if (artifact === "") {
 		throw new RalplanCommandError(2, "artifact content is empty");
 	}
-	return { stage: stage as RalplanStage, stageN, runId, artifact, sessionId, json: hasFlag(args, "--json") };
+	return {
+		stage: stage as RalplanStage,
+		stageN,
+		runId,
+		artifact,
+		executionPlan,
+		sessionId,
+		json: hasFlag(args, "--json"),
+	};
 }
 
 interface PersistedArtifact {
@@ -458,12 +588,14 @@ interface PersistedArtifact {
 	sha256: string;
 	createdAt: string;
 	pendingApprovalPath?: string;
+	executionPlanPath?: string;
+	executionPlanSha256?: string;
 }
 
 /**
- * Content-addressed identity for an `index.jsonl` row: a repeated `--write` of the
- * same `(stage, stage_n)` at identical content (same sha256) is the #638 duplicate
- * the append must collapse. Rows missing these fields opt out of dedup.
+ * Stage artifacts are stage-scoped, but the execution plan is run-scoped. Once
+ * any committed row declares a plan digest, that digest remains authoritative
+ * for every later publication in the run.
  */
 function ralplanIndexKey(entry: unknown): string | undefined {
 	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
@@ -472,12 +604,38 @@ function ralplanIndexKey(entry: unknown): string | undefined {
 	if (typeof stage !== "string" || typeof stage_n !== "number" || typeof sha256 !== "string") return undefined;
 	return `${stage}\u0000${stage_n}\u0000${sha256}`;
 }
+async function readRunExecutionPlanDigest(runDir: string): Promise<string | undefined> {
+	let text: string;
+	try {
+		text = await fs.readFile(path.join(runDir, "index.jsonl"), "utf8");
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return undefined;
+		throw new RalplanCommandError(2, `failed to read ralplan index: ${err.message}`);
+	}
+	let digest: string | undefined;
+	for (const line of text.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		try {
+			const row = JSON.parse(line) as Record<string, unknown>;
+			if (typeof row.execution_plan_sha256 !== "string") continue;
+			if (digest !== undefined && digest !== row.execution_plan_sha256) {
+				throw new RalplanCommandError(2, "conflicting execution plan identities in ralplan index");
+			}
+			digest = row.execution_plan_sha256;
+		} catch (error) {
+			if (error instanceof RalplanCommandError) throw error;
+		}
+	}
+	return digest;
+}
 
 async function persistArtifact(
 	resolved: ResolvedArtifactArgs,
 	cwd: string,
 	content: string,
 	sha256: string,
+	runExecutionPlanSha256?: string,
 ): Promise<PersistedArtifact> {
 	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
 
@@ -502,17 +660,12 @@ async function persistArtifact(
 		created_at: createdAt,
 		sha256,
 	};
-	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
-		cwd,
-		audit: {
-			category: "ledger",
-			verb: "append",
-			owner: "gjc-runtime",
-			skill: "ralplan",
-			sessionId: resolved.sessionId,
-		},
-		key: ralplanIndexKey,
-	});
+	const executionPlanSha256 =
+		runExecutionPlanSha256 ??
+		(resolved.executionPlan === undefined
+			? undefined
+			: createHash("sha256").update(resolved.executionPlan).digest("hex"));
+	if (executionPlanSha256) Object.assign(indexEntry, { execution_plan_sha256: executionPlanSha256 });
 
 	let pendingApprovalPath: string | undefined;
 	if (resolved.stage === "final") {
@@ -528,7 +681,34 @@ async function persistArtifact(
 			},
 		});
 	}
+	let executionPlanPath: string | undefined;
+	if (resolved.executionPlan !== undefined) {
+		executionPlanPath = path.join(runDir, "execution-plan.json");
+		await writeArtifact(executionPlanPath, resolved.executionPlan, {
+			cwd,
+			audit: {
+				category: "artifact",
+				verb: "write",
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId: resolved.sessionId,
+			},
+		});
+	}
 
+	// Publish the index row last so readers never discover a stage before all
+	// required sidecars exist. A failed pre-publication write is safely retryable.
+	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
+		cwd,
+		audit: {
+			category: "ledger",
+			verb: "append",
+			owner: "gjc-runtime",
+			skill: "ralplan",
+			sessionId: resolved.sessionId,
+		},
+		key: ralplanIndexKey,
+	});
 	return {
 		runId: resolved.runId,
 		path: filePath,
@@ -537,14 +717,17 @@ async function persistArtifact(
 		sha256,
 		createdAt,
 		pendingApprovalPath,
+		executionPlanPath,
+		executionPlanSha256,
 	};
 }
 
-/** The persisted `(stage, stage_n)` artifact recorded in a run's `index.jsonl`. */
+/** The committed publication identity recorded in a run's `index.jsonl`. */
 interface ExistingStageArtifact {
 	path: string;
 	sha256: string;
 	createdAt: string;
+	executionPlanSha256?: string;
 }
 
 /**
@@ -586,6 +769,8 @@ async function findExistingStageArtifact(
 			path: record.path,
 			sha256: record.sha256,
 			createdAt: typeof record.created_at === "string" ? record.created_at : "",
+			executionPlanSha256:
+				typeof record.execution_plan_sha256 === "string" ? record.execution_plan_sha256 : undefined,
 		};
 	}
 	return match;
@@ -664,35 +849,145 @@ async function buildRalplanHud(options: {
 	});
 }
 
+async function inspectPublicationMember(filePath: string, expected: string, label: string): Promise<boolean> {
+	try {
+		const existing = await fs.readFile(filePath, "utf8");
+		if (existing !== expected) {
+			throw new RalplanCommandError(2, `refusing to overwrite conflicting ralplan ${label} at ${filePath}`);
+		}
+		return true;
+	} catch (error) {
+		if (error instanceof RalplanCommandError) throw error;
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return false;
+		throw new RalplanCommandError(2, `failed to read existing ralplan ${label} ${filePath}: ${err.message}`);
+	}
+}
+
+async function inspectPublicationMembers(
+	resolved: ResolvedArtifactArgs,
+	cwd: string,
+	content: string,
+	existingStage: boolean,
+): Promise<boolean> {
+	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
+	const members: Array<[string, string, string]> = [
+		[
+			`stage-${resolved.stageN}-${resolved.stage}`,
+			path.join(runDir, `stage-${pad2(resolved.stageN)}-${resolved.stage}.md`),
+			content,
+		],
+	];
+	if (resolved.stage === "final" && existingStage) {
+		members.push(["pending approval", path.join(runDir, "pending-approval.md"), content]);
+	}
+	if (resolved.executionPlan !== undefined) {
+		members.push(["execution plan", path.join(runDir, "execution-plan.json"), resolved.executionPlan]);
+	}
+	const presence = await Promise.all(
+		members.map(([label, filePath, expected]) => inspectPublicationMember(filePath, expected, label)),
+	);
+	return presence.every(Boolean);
+}
+
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	const plannerState = parsePlannerStateArgs(args);
 	const resolved = await resolveArtifactArgs(args, cwd);
 	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
 	const sha256 = createHash("sha256").update(content).digest("hex");
 
-	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
-	// silently clobber the artifact or append a duplicate ledger row. Classify before any
-	// state mutation so a conflict never regresses run-state phase.
-	const existingArtifact = await findExistingStageArtifact(
-		cwd,
-		resolved.sessionId,
-		resolved.runId,
-		resolved.stage,
-		resolved.stageN,
-	);
-	if (existingArtifact) {
-		if (existingArtifact.sha256 !== sha256) {
-			throw new RalplanCommandError(
-				2,
-				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
+	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
+	await fs.mkdir(runDir, { recursive: true });
+	const publicationLockPath = path.join(runDir, "publication");
+	const publication = await withWorkflowStateLock(
+		publicationLockPath,
+		async () => {
+			const existingArtifact = await findExistingStageArtifact(
+				cwd,
+				resolved.sessionId,
+				resolved.runId,
+				resolved.stage,
+				resolved.stageN,
 			);
-		}
-		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd);
+			const committedExecutionPlanSha256 = await readRunExecutionPlanDigest(runDir);
+			const suppliedExecutionPlanSha256 =
+				resolved.executionPlan === undefined
+					? undefined
+					: createHash("sha256").update(resolved.executionPlan).digest("hex");
+			if (
+				committedExecutionPlanSha256 !== undefined &&
+				suppliedExecutionPlanSha256 !== undefined &&
+				committedExecutionPlanSha256 !== suppliedExecutionPlanSha256
+			) {
+				throw new RalplanCommandError(
+					2,
+					`refusing to change committed ralplan execution plan (existing sha256=${committedExecutionPlanSha256}, new sha256=${suppliedExecutionPlanSha256})`,
+				);
+			}
+			if (committedExecutionPlanSha256 !== undefined && suppliedExecutionPlanSha256 === undefined) {
+				const executionPlanPath = path.join(runDir, "execution-plan.json");
+				let existing: string;
+				try {
+					existing = await fs.readFile(executionPlanPath, "utf8");
+				} catch {
+					throw new RalplanCommandError(
+						2,
+						`committed ralplan execution plan is missing at ${executionPlanPath}; retry with --execution-plan to repair it`,
+					);
+				}
+				const actual = createHash("sha256").update(existing).digest("hex");
+				if (actual !== committedExecutionPlanSha256) {
+					throw new RalplanCommandError(
+						2,
+						`committed ralplan execution plan conflicts at ${executionPlanPath} (expected sha256=${committedExecutionPlanSha256}, actual sha256=${actual})`,
+					);
+				}
+			}
+			if (existingArtifact && existingArtifact.sha256 !== sha256) {
+				throw new RalplanCommandError(
+					2,
+					`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
+				);
+			}
+			if (existingArtifact) {
+				const effectiveExecutionPlanSha256 = suppliedExecutionPlanSha256 ?? committedExecutionPlanSha256;
+				if (
+					existingArtifact.executionPlanSha256 !== undefined &&
+					existingArtifact.executionPlanSha256 !== effectiveExecutionPlanSha256
+				) {
+					throw new RalplanCommandError(
+						2,
+						`refusing to change committed ralplan execution plan (existing sha256=${existingArtifact.executionPlanSha256}, new sha256=${effectiveExecutionPlanSha256 ?? "<absent>"})`,
+					);
+				}
+			}
+
+			const complete = await inspectPublicationMembers(resolved, cwd, content, existingArtifact !== undefined);
+			if (existingArtifact && complete) {
+				return { existingArtifact } as const;
+			}
+
+			// The ledger row is published last by persistArtifact. Missing members from an
+			// interrupted identical publication are recreated while this publication lock
+			// is held; conflicting members are rejected by the inspection above.
+			const persisted = await persistArtifact(
+				resolved,
+				cwd,
+				content,
+				sha256,
+				committedExecutionPlanSha256 ?? suppliedExecutionPlanSha256,
+			);
+			return { persisted } as const;
+		},
+		{ cwd },
+	);
+	if ("existingArtifact" in publication && publication.existingArtifact !== undefined) {
+		return buildDeduplicatedResult(resolved, publication.existingArtifact, sha256, cwd);
 	}
 
-	// Keep run-state `current_phase` coherent with the stage being persisted.
+	// Keep run-state coherent only after the content-addressed publication commits.
 	await persistActiveRunId(cwd, resolved.sessionId, resolved.runId, resolved.stage);
-	const persisted = await persistArtifact(resolved, cwd, content, sha256);
+	const persisted = publication.persisted;
 	if (plannerState) {
 		await applyPlannerStateUpdate(cwd, resolved.sessionId, plannerState);
 	}
@@ -715,6 +1010,8 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		created_at: persisted.createdAt,
 	};
 	if (persisted.pendingApprovalPath) payload.pending_approval_path = persisted.pendingApprovalPath;
+	if (persisted.executionPlanPath) payload.execution_plan_path = persisted.executionPlanPath;
+	if (persisted.executionPlanSha256) payload.execution_plan_sha256 = persisted.executionPlanSha256;
 	if (plannerState) payload.planner_state = plannerStatePayload(plannerState);
 	const stdout = resolved.json
 		? `${JSON.stringify(payload, null, 2)}\n`
@@ -749,6 +1046,15 @@ function buildDeduplicatedResult(
 			resolved.runId,
 			"pending-approval.md",
 		);
+	}
+	if (existing.executionPlanSha256 !== undefined) {
+		payload.execution_plan_path = path.join(
+			sessionPlansDir(cwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			"execution-plan.json",
+		);
+		payload.execution_plan_sha256 = existing.executionPlanSha256;
 	}
 	const stdout = resolved.json
 		? `${JSON.stringify(payload, null, 2)}\n`

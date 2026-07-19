@@ -7,6 +7,14 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
+	type GjcTeamSnapshot,
+	type GjcTeamTask,
+	listGjcTeamTasks,
+	readGjcTeamSnapshot,
+	shutdownGjcTeam,
+	startGjcTeam,
+} from "./team-runtime";
+import {
 	computeUltragoalPlanGeneration,
 	findFreshBatchCloseReceipt,
 	findLedgerReceiptEvent,
@@ -35,6 +43,7 @@ import {
 } from "./state-writer";
 
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
+export type UltragoalExecutionMode = "sequential" | "parallel_group";
 export type UltragoalGoalStatus =
 	| "pending"
 	| "active"
@@ -148,6 +157,9 @@ export interface UltragoalGoal {
 	completionVerification?: UltragoalCompletionVerification;
 	pipelineMetadata?: UltragoalPipelineMetadata;
 	validationBatch?: UltragoalValidationBatchMetadata;
+	execution?: UltragoalExecutionMode;
+	lanes_ref?: string;
+	execution_lanes?: ExecutionPlanLane[];
 }
 
 export interface UltragoalPlan {
@@ -1478,6 +1490,8 @@ export async function createUltragoalPlan(input: {
 	goalMetadataJson?: string;
 	validationBatches?: UltragoalValidationBatchInput[];
 	validationBatchJson?: string;
+	executionPlan?: unknown;
+	executionPlanRef?: string;
 }): Promise<UltragoalPlan> {
 	const brief = input.brief.trim();
 	if (!brief) throw new Error("ultragoal brief is required");
@@ -1511,6 +1525,7 @@ export async function createUltragoalPlan(input: {
 		validationBatchInput === undefined
 			? []
 			: parseValidationBatchInput(validationBatchInput, goalIds, input.gjcGoalMode ?? "aggregate");
+	const executionPlan = parseExecutionPlan(input.executionPlan, goals, input.executionPlanRef);
 	const metadataByGoalId = new Map(metadata.map(item => [item.goalId, item]));
 	const validationBatchByGoalId = new Map<string, UltragoalValidationBatchMetadata>();
 	for (const batch of validationBatches)
@@ -1519,6 +1534,12 @@ export async function createUltragoalPlan(input: {
 		goal.pipelineMetadata = metadataByGoalId.get(goal.id) ?? legacyPipelineMetadata(goal.id);
 		goal.validationBatch = validationBatchByGoalId.get(goal.id);
 		validateValidationBatchPipelineExclusion(goal);
+		const execution = executionPlan.get(goal.title);
+		if (execution) {
+			goal.execution = execution.execution;
+			goal.lanes_ref = execution.lanesRef;
+			goal.execution_lanes = execution.lanes;
+		}
 	}
 	const plan: UltragoalPlan = {
 		version: 1,
@@ -1532,6 +1553,117 @@ export async function createUltragoalPlan(input: {
 	await writePlan(input.cwd, plan, input.sessionId);
 	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) }, input.sessionId);
 	return plan;
+}
+
+export interface ExecutionPlanLane {
+	id: string;
+	role: "executor" | "architect" | "planner" | "critic";
+	after: string[];
+}
+
+function parseMarkdownLanes(objective: string): Map<string, string[]> {
+	const lanes = new Map<string, string[]>();
+	const heading = /^### Lane ([A-Za-z0-9]+) — .+?(?: \(after: ([^)]+)\))?\s*$/;
+	for (const line of objective.split(/\r?\n/)) {
+		if (!line.startsWith("### Lane ")) continue;
+		const match = heading.exec(line);
+		if (!match) throw new Error(`invalid execution-plan lane markdown: ${line}`);
+		const id = match[1];
+		if (lanes.has(id)) throw new Error(`duplicate execution-plan markdown lane: ${id}`);
+		lanes.set(
+			id,
+			match[2]
+				? match[2]
+						.split(",")
+						.map(item => item.trim())
+						.filter(Boolean)
+				: [],
+		);
+	}
+	return lanes;
+}
+
+function parseExecutionPlan(
+	value: unknown,
+	goals: readonly UltragoalGoal[],
+	ref?: string,
+): Map<string, { execution: UltragoalExecutionMode; lanesRef?: string; lanes: ExecutionPlanLane[] }> {
+	const result = new Map<
+		string,
+		{ execution: UltragoalExecutionMode; lanesRef?: string; lanes: ExecutionPlanLane[] }
+	>();
+	if (value === undefined) return result;
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error("execution-plan.json must be an object");
+	const document = value as Record<string, unknown>;
+	if (document.version !== 1 || !Array.isArray(document.goals))
+		throw new Error("execution-plan.json requires version 1 and goals");
+	const goalByTitle = new Map(goals.map(goal => [goal.title, goal]));
+	if (goalByTitle.size !== goals.length) throw new Error("execution-plan goal titles must be unique");
+	const roles = new Set(["executor", "architect", "planner", "critic"]);
+	for (const [index, raw] of document.goals.entries()) {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw))
+			throw new Error(`execution-plan goal ${index + 1} must be an object`);
+		const row = raw as Record<string, unknown>;
+		const title = typeof row.title === "string" ? row.title.trim() : "";
+		const execution = row.execution;
+		if (!title || !goalByTitle.has(title))
+			throw new Error(`execution-plan goal title mismatch: ${title || index + 1}`);
+		if (result.has(title)) throw new Error(`duplicate execution-plan goal title: ${title}`);
+		if (execution !== "sequential" && execution !== "parallel_group")
+			throw new Error(`invalid execution-plan execution for ${title}`);
+		const rawLanes = row.lanes;
+		if (!Array.isArray(rawLanes)) throw new Error(`execution-plan lanes must be an array for ${title}`);
+		const lanes: ExecutionPlanLane[] = rawLanes.map((rawLane, laneIndex) => {
+			if (!rawLane || typeof rawLane !== "object" || Array.isArray(rawLane))
+				throw new Error(`execution-plan lane ${laneIndex + 1} for ${title} must be an object`);
+			const lane = rawLane as Record<string, unknown>;
+			const id = typeof lane.id === "string" ? lane.id.trim() : "";
+			const role = lane.role;
+			if (!id) throw new Error(`execution-plan lane id is required for ${title}`);
+			if (typeof role !== "string" || !roles.has(role))
+				throw new Error(`invalid execution-plan role for lane ${id}`);
+			if (!Array.isArray(lane.after) || lane.after.some(item => typeof item !== "string"))
+				throw new Error(`invalid execution-plan dependencies for lane ${id}`);
+			return { id, role: role as ExecutionPlanLane["role"], after: lane.after as string[] };
+		});
+		const ids = new Set(lanes.map(lane => lane.id));
+		if (ids.size !== lanes.length) throw new Error(`duplicate execution-plan lane for ${title}`);
+		for (const lane of lanes)
+			if (lane.after.some(dependency => dependency === lane.id || !ids.has(dependency)))
+				throw new Error(`invalid execution-plan dependency for lane ${lane.id}`);
+		const visiting = new Set<string>();
+		const visited = new Set<string>();
+		const byId = new Map(lanes.map(lane => [lane.id, lane]));
+		const visit = (id: string): void => {
+			if (visiting.has(id)) throw new Error(`execution-plan lane dependency cycle for ${title}`);
+			if (visited.has(id)) return;
+			visiting.add(id);
+			for (const dependency of byId.get(id)?.after ?? []) visit(dependency);
+			visiting.delete(id);
+			visited.add(id);
+		};
+		for (const lane of lanes) visit(lane.id);
+		if (execution === "parallel_group") {
+			if (lanes.length === 0) throw new Error(`parallel_group requires lanes for ${title}`);
+			const markdown = parseMarkdownLanes(goalByTitle.get(title)?.objective ?? "");
+			if (markdown.size !== lanes.length) throw new Error(`execution-plan markdown lane mismatch for ${title}`);
+			for (const lane of lanes) {
+				const dependencies = markdown.get(lane.id);
+				if (!dependencies || dependencies.join("\0") !== lane.after.join("\0"))
+					throw new Error(`execution-plan markdown dependency mismatch for lane ${lane.id}`);
+			}
+			const lanesById = new Map(lanes.map(lane => [lane.id, lane]));
+			lanes.splice(0, lanes.length, ...Array.from(markdown.keys(), id => lanesById.get(id)!));
+		}
+		result.set(title, {
+			execution,
+			lanesRef: execution === "parallel_group" ? `${ref ?? "execution-plan.json"}#/goals/${index}/lanes` : undefined,
+			lanes,
+		});
+	}
+	if (result.size !== goals.length) throw new Error("execution-plan must map every markdown goal title exactly once");
+	return result;
 }
 
 function chooseNextGoal(plan: UltragoalPlan, retryFailed: boolean): UltragoalGoal | undefined {
@@ -1889,6 +2021,260 @@ export async function startNextUltragoalGoal(input: {
 		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
 	}
 	return { plan, goal, allComplete: false };
+}
+
+export interface UltragoalParallelHandoff {
+	team_name: string;
+	goal_id: string;
+	lanes_ref: string;
+	lanes: ExecutionPlanLane[];
+	barrier_owner: "leader";
+	worker_goal_state_mutation: false;
+}
+
+export async function recordUltragoalParallelHandoff(input: {
+	cwd: string;
+	goal: UltragoalGoal;
+	sessionId?: string | null;
+}): Promise<UltragoalParallelHandoff> {
+	if (input.goal.execution !== "parallel_group" || !input.goal.lanes_ref)
+		throw new Error(`Goal ${input.goal.id} is not a valid parallel_group handoff`);
+	const handoff: UltragoalParallelHandoff = {
+		team_name: `ultragoal-${input.goal.id.toLowerCase()}`,
+		goal_id: input.goal.id,
+		lanes_ref: input.goal.lanes_ref,
+		lanes: input.goal.execution_lanes ?? [],
+		barrier_owner: "leader",
+		worker_goal_state_mutation: false,
+	};
+	await appendLedger(
+		input.cwd,
+		{ event: "parallel_group_handoff", goalId: input.goal.id, ...handoff },
+		input.sessionId,
+	);
+	return handoff;
+}
+
+export interface UltragoalParallelRuntime {
+	launch(input: {
+		teamName: string;
+		objective: string;
+		lanes: readonly ExecutionPlanLane[];
+		cwd: string;
+	}): Promise<GjcTeamSnapshot>;
+	snapshot(teamName: string, cwd: string): Promise<GjcTeamSnapshot>;
+	tasks(teamName: string, cwd: string): Promise<GjcTeamTask[]>;
+	shutdown(teamName: string, cwd: string): Promise<GjcTeamSnapshot>;
+	leaderSessionId?(teamName: string, cwd: string): Promise<string>;
+}
+
+const DEFAULT_PARALLEL_RUNTIME: UltragoalParallelRuntime = {
+	launch: async input =>
+		await startGjcTeam({
+			workerCount: input.lanes.length,
+			agentType: "executor",
+			agentTypes: input.lanes.map(lane => lane.role),
+			task: input.objective,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			env: { ...process.env, GJC_TEAM_BACKEND: "headless" },
+			worktreeMode: { enabled: false },
+		}),
+	snapshot: async (teamName, cwd) => await readGjcTeamSnapshot(teamName, cwd),
+	tasks: async (teamName, cwd) => await listGjcTeamTasks(teamName, cwd),
+	shutdown: async (teamName, cwd) =>
+		await shutdownGjcTeam(teamName, cwd, { ...process.env, GJC_TEAM_BACKEND: "headless" }),
+	leaderSessionId: async (teamName, cwd) => {
+		const snapshot = await readGjcTeamSnapshot(teamName, cwd);
+		if (!snapshot.state_dir) throw new Error("parallel_group team has no durable state directory");
+		const config = (await Bun.file(path.join(snapshot.state_dir, "config.json")).json()) as {
+			leader?: { session_id?: unknown };
+		};
+		return typeof config.leader?.session_id === "string" ? config.leader.session_id.trim() : "";
+	},
+};
+
+export interface UltragoalParallelBarrier {
+	ready: boolean;
+	failedTaskIds: string[];
+	reason?: "tasks_incomplete" | "task_failed" | "awaiting_integration";
+}
+
+export async function inspectUltragoalParallelBarrier(input: {
+	cwd: string;
+	teamName: string;
+	runtime?: UltragoalParallelRuntime;
+}): Promise<UltragoalParallelBarrier> {
+	const runtime = input.runtime ?? DEFAULT_PARALLEL_RUNTIME;
+	const [snapshot, tasks] = await Promise.all([
+		runtime.snapshot(input.teamName, input.cwd),
+		runtime.tasks(input.teamName, input.cwd),
+	]);
+	const failedTaskIds = tasks.filter(task => task.status === "failed").map(task => task.id);
+	if (failedTaskIds.length > 0 || snapshot.phase === "failed" || snapshot.phase === "cancelled")
+		return { ready: false, failedTaskIds, reason: "task_failed" };
+	if (snapshot.phase === "awaiting_integration")
+		return { ready: false, failedTaskIds: [], reason: "awaiting_integration" };
+	if (
+		snapshot.task_counts.pending !== 0 ||
+		snapshot.task_counts.blocked !== 0 ||
+		snapshot.task_counts.in_progress !== 0 ||
+		snapshot.task_counts.failed !== 0
+	)
+		return { ready: false, failedTaskIds: [], reason: "tasks_incomplete" };
+	return { ready: true, failedTaskIds: [] };
+}
+
+export async function launchUltragoalParallelGroup(input: {
+	cwd: string;
+	goal: UltragoalGoal;
+	runtime?: UltragoalParallelRuntime;
+	sessionId?: string | null;
+	qualityGateJson?: string;
+}): Promise<UltragoalParallelHandoff> {
+	const handoff = await recordUltragoalParallelHandoff(input);
+	const lanes = input.goal.execution_lanes ?? [];
+	if (lanes.length === 0) throw new Error(`Goal ${input.goal.id} has no parallel lanes`);
+	await (input.runtime ?? DEFAULT_PARALLEL_RUNTIME).launch({
+		teamName: handoff.team_name,
+		objective: input.goal.objective,
+		lanes,
+		cwd: input.cwd,
+	});
+	await appendLedger(
+		input.cwd,
+		{
+			event: "parallel_group_launched",
+			goalId: input.goal.id,
+			team_name: handoff.team_name,
+			quality_gate_json: input.qualityGateJson?.trim() || undefined,
+		},
+		input.sessionId,
+	);
+	return handoff;
+}
+
+async function authorizeUltragoalParallelLeader(input: {
+	cwd: string;
+	goalId: string;
+	teamName: string;
+	runtime: UltragoalParallelRuntime;
+}): Promise<void> {
+	const currentSessionId = currentUltragoalSessionId(input.cwd);
+	const leaderSessionId = input.runtime.leaderSessionId
+		? await input.runtime.leaderSessionId(input.teamName, input.cwd)
+		: "";
+	if (!leaderSessionId || leaderSessionId !== currentSessionId)
+		throw new Error("parallel_group checkpoint requires durable current-session leader provenance");
+	const ledger = await readUltragoalLedger(input.cwd, currentSessionId);
+	const launchIndex = ledger.findLastIndex(
+		event =>
+			event.event === "parallel_group_launched" &&
+			event.goalId === input.goalId &&
+			event.team_name === input.teamName,
+	);
+	if (launchIndex < 0)
+		throw new Error(
+			"parallel_group checkpoint requires a prior current-session launch binding for goal_id and team_name",
+		);
+	const stale = ledger
+		.slice(launchIndex + 1)
+		.some(
+			event =>
+				(event.event === "parallel_group_joined" || event.event === "parallel_group_reaped") &&
+				event.goalId === input.goalId &&
+				event.team_name === input.teamName,
+		);
+	if (stale) throw new Error("parallel_group checkpoint launch binding is stale");
+}
+
+async function validateUltragoalParallelCompleteCheckpoint(input: {
+	cwd: string;
+	goalId: string;
+	evidence: string;
+	qualityGateJson: string;
+}): Promise<void> {
+	const plan = await readUltragoalPlan(input.cwd);
+	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	const goal = plan.goals.find(item => item.id === input.goalId);
+	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
+	if (!input.evidence.trim()) throw new Error("checkpoint evidence is required");
+	const ledger = await readUltragoalLedger(input.cwd);
+	const changeSet = await computeCheckpointChangeSet(input.cwd);
+	requireFreshValidationBatchMetadata(goal);
+	validatePipelineCheckpointSafety(plan, goal, changeSet);
+	validateCompleteCheckpointTargetGoal(goal);
+	await readRequiredCompletionQualityGate(input.cwd, input.qualityGateJson, {
+		changeSet,
+		plan,
+		goal,
+		ledger,
+	});
+}
+
+export async function checkpointUltragoalParallelGroup(input: {
+	cwd: string;
+	goalId: string;
+	teamName: string;
+	qualityGateJson: string;
+	runtime?: UltragoalParallelRuntime;
+	leader: boolean;
+}): Promise<UltragoalCheckpointContinuation> {
+	const runtime = input.runtime ?? DEFAULT_PARALLEL_RUNTIME;
+	if (input.leader !== true) throw new Error("parallel_group checkpoint requires --leader");
+	await authorizeUltragoalParallelLeader({ ...input, runtime });
+	if (!input.qualityGateJson.trim()) throw new Error("parallel_group checkpoint requires --quality-gate-json");
+	const barrier = await inspectUltragoalParallelBarrier({ ...input, runtime });
+	if (!barrier.ready && barrier.reason !== "task_failed")
+		throw new Error(`parallel_group barrier not satisfied: ${barrier.reason}`);
+	const evidence = barrier.ready
+		? `Headless team ${input.teamName} completed its strict launch barrier and shut down cleanly.`
+		: `Headless team ${input.teamName} barrier failed; task ids: ${barrier.failedTaskIds.join(", ") || "none"}.`;
+	if (barrier.ready) {
+		await validateUltragoalParallelCompleteCheckpoint({
+			cwd: input.cwd,
+			goalId: input.goalId,
+			evidence,
+			qualityGateJson: input.qualityGateJson,
+		});
+	}
+	let terminalSnapshot: Awaited<ReturnType<UltragoalParallelRuntime["shutdown"]>> | undefined;
+	try {
+		terminalSnapshot = await runtime.shutdown(input.teamName, input.cwd);
+		if (terminalSnapshot.phase !== (barrier.ready ? "complete" : "failed"))
+			throw new Error(
+				`parallel_group shutdown did not reach ${barrier.ready ? "complete" : "failed"} phase: ${terminalSnapshot.phase}`,
+			);
+	} catch (error) {
+		await appendLedger(input.cwd, {
+			event: "parallel_group_shutdown_failed",
+			goalId: input.goalId,
+			team_name: input.teamName,
+			phase: terminalSnapshot?.phase,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw error;
+	}
+	await appendLedger(input.cwd, {
+		event: "parallel_group_joined",
+		goalId: input.goalId,
+		team_name: input.teamName,
+		ready: barrier.ready,
+		failed_task_ids: barrier.failedTaskIds,
+	});
+	await appendLedger(input.cwd, {
+		event: "parallel_group_reaped",
+		goalId: input.goalId,
+		team_name: input.teamName,
+	});
+	return await checkpointAndContinueUltragoalGoal({
+		cwd: input.cwd,
+		goalId: input.goalId,
+		status: barrier.ready ? "complete" : "failed",
+		evidence,
+		qualityGateJson: input.qualityGateJson,
+		advanceNext: barrier.ready,
+	});
 }
 
 async function readStructuredValue(cwd: string, value: string): Promise<unknown> {
@@ -5207,6 +5593,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  create-goals",
 		"  complete-goals",
 		"  checkpoint",
+		"  join-parallel-group",
 		"  review",
 		"  steer",
 		"  record-review-blockers",
@@ -5220,12 +5607,22 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 	].join("\n");
 }
 
-async function readBrief(cwd: string, args: readonly string[]): Promise<string> {
+async function readBrief(
+	cwd: string,
+	args: readonly string[],
+): Promise<{ brief: string; executionPlan?: unknown; executionPlanRef?: string }> {
 	const inline = flagValue(args, "--brief");
-	if (inline !== undefined) return inline;
+	if (inline !== undefined) return { brief: inline };
 	const briefFile = flagValue(args, "--brief-file");
-	if (briefFile !== undefined) return await Bun.file(path.resolve(cwd, briefFile)).text();
-	if (hasFlag(args, "--from-stdin")) return await Bun.stdin.text();
+	if (briefFile !== undefined) {
+		const resolved = path.resolve(cwd, briefFile);
+		const brief = await Bun.file(resolved).text();
+		if (path.basename(resolved) !== "pending-approval.md") return { brief };
+		const sidecar = path.join(path.dirname(resolved), "execution-plan.json");
+		if (!(await Bun.file(sidecar).exists())) return { brief };
+		return { brief, executionPlan: await Bun.file(sidecar).json(), executionPlanRef: sidecar };
+	}
+	if (hasFlag(args, "--from-stdin")) return { brief: await Bun.stdin.text() };
 	throw new Error("create-goals requires --brief, --brief-file, or --from-stdin");
 }
 
@@ -5238,17 +5635,29 @@ function renderCompleteHandoff(
 	result: { plan: UltragoalPlan; goal?: UltragoalGoal; allComplete: boolean },
 	json: boolean,
 	cwd: string,
+	parallelHandoff?: UltragoalParallelHandoff,
 ): string {
 	if (json) {
 		return renderCliWriteReceipt({
 			ok: true,
 			all_complete: result.allComplete,
-			next_action: result.allComplete ? "none" : "execute-goal",
+			next_action: result.allComplete ? "none" : parallelHandoff ? "complete-goals" : "execute-goal",
 			goal_id: result.goal?.id,
 			goal_status: result.goal?.status,
 			gjc_objective: result.plan.gjcObjective,
 			goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
+			execution: parallelHandoff ? "parallel_group" : undefined,
+			parallel_handoff: parallelHandoff,
 		});
+	}
+	if (parallelHandoff) {
+		return [
+			`ultragoal next-action=complete-goals goal-id=${parallelHandoff.goal_id} team-name=${parallelHandoff.team_name}`,
+			`lanes-ref=${parallelHandoff.lanes_ref}`,
+			"barrier-owner=leader worker-goal-state-mutation=false",
+			"leader-command=gjc ultragoal complete-goals",
+			"",
+		].join("\n");
 	}
 	if (result.allComplete) return "ultragoal complete all=true\n";
 	if (!result.goal) return "ultragoal next-action=none\n";
@@ -5443,7 +5852,16 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 	}
 }
 
-async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
+export interface UltragoalCommandRuntime {
+	env?: NodeJS.ProcessEnv;
+	parallelRuntime?: UltragoalParallelRuntime;
+}
+
+async function dispatchUltragoalCommand(
+	args: string[],
+	cwd: string,
+	runtime: UltragoalCommandRuntime = {},
+): Promise<UltragoalCommandResult> {
 	// Help must not require a resolvable session; render it before session resolution.
 	const help = renderUltragoalHelp(args);
 	if (help) return { status: 0, stdout: help };
@@ -5471,12 +5889,15 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 					throw new Error("--validation-batch-json and --goal-metadata-json are mutually exclusive");
 				}
 				const mode = flagValue(args, "--gjc-goal-mode") === "per-story" ? "per-story" : "aggregate";
+				const briefInput = await readBrief(cwd, args);
 				const plan = await createUltragoalPlan({
 					cwd,
-					brief: await readBrief(cwd, args),
+					brief: briefInput.brief,
 					gjcGoalMode: mode,
 					goalMetadataJson: flagValue(args, "--goal-metadata-json"),
 					validationBatchJson: flagValue(args, "--validation-batch-json"),
+					executionPlan: briefInput.executionPlan,
+					executionPlanRef: briefInput.executionPlanRef,
 				});
 				return {
 					status: 0,
@@ -5491,15 +5912,126 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 						: `Created ultragoal plan with ${plan.goals.length} goal${plan.goals.length === 1 ? "" : "s"} at ${getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath}.\n`,
 				};
 			}
-			case "complete-goals":
+			case "complete-goals": {
+				const result = await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") });
+				const commandEnv = runtime.env ?? process.env;
+				const parallelEnabled =
+					commandEnv.GJC_ULTRAGOAL_PARALLEL === "1" &&
+					(commandEnv.GJC_TEAM_BACKEND === undefined || commandEnv.GJC_TEAM_BACKEND === "headless");
+				if (!parallelEnabled || result.goal?.execution !== "parallel_group") {
+					return { status: 0, stdout: renderCompleteHandoff(result, json, cwd) };
+				}
+
+				const ledger = await readUltragoalLedger(cwd, sessionId);
+				const launch = [...ledger]
+					.reverse()
+					.find(
+						event =>
+							event.event === "parallel_group_launched" &&
+							event.goalId === result.goal?.id &&
+							!ledger.some(
+								later =>
+									later.timestamp &&
+									event.timestamp &&
+									later.timestamp >= event.timestamp &&
+									(later.event === "parallel_group_joined" || later.event === "parallel_group_reaped") &&
+									later.goalId === event.goalId &&
+									later.team_name === event.team_name,
+							),
+					);
+				const suppliedQualityGate = flagValue(args, "--quality-gate-json")?.trim();
+				if (!launch) {
+					const parallelHandoff = await launchUltragoalParallelGroup({
+						cwd,
+						goal: result.goal,
+						sessionId,
+						runtime: runtime.parallelRuntime,
+						qualityGateJson: suppliedQualityGate,
+					});
+					return {
+						status: 0,
+						stdout: renderCompleteHandoff(result, json, cwd, parallelHandoff),
+					};
+				}
+
+				const teamName = String(launch.team_name ?? "");
+				const barrier = await inspectUltragoalParallelBarrier({
+					cwd,
+					teamName,
+					runtime: runtime.parallelRuntime,
+				});
+				if (!barrier.ready && barrier.reason !== "task_failed") {
+					const nextAction =
+						barrier.reason === "awaiting_integration"
+							? "complete team integration, then rerun `gjc ultragoal complete-goals`"
+							: "wait for terminal team tasks, then rerun `gjc ultragoal complete-goals`";
+					return {
+						status: 0,
+						stdout: json
+							? renderCliWriteReceipt({
+									ok: true,
+									goal_id: result.goal.id,
+									goal_status: result.goal.status,
+									execution: "parallel_group",
+									team_name: teamName,
+									barrier_reason: barrier.reason,
+									next_action: nextAction,
+								})
+							: `ultragoal next-action=${nextAction} goal-id=${result.goal.id} team-name=${teamName}\n`,
+					};
+				}
+
+				const storedQualityGate =
+					typeof launch.quality_gate_json === "string" ? launch.quality_gate_json.trim() : "";
+				const qualityGateJson = suppliedQualityGate || storedQualityGate;
+				if (barrier.ready && !qualityGateJson) {
+					const nextAction =
+						"rerun `gjc ultragoal complete-goals --quality-gate-json '<verified-quality-gate-json>'`";
+					return {
+						status: 0,
+						stdout: json
+							? renderCliWriteReceipt({
+									ok: true,
+									goal_id: result.goal.id,
+									goal_status: result.goal.status,
+									execution: "parallel_group",
+									team_name: teamName,
+									next_action: nextAction,
+								})
+							: `ultragoal next-action=${nextAction} goal-id=${result.goal.id} team-name=${teamName}\n`,
+					};
+				}
+
+				const checkpoint = await checkpointUltragoalParallelGroup({
+					cwd,
+					goalId: result.goal.id,
+					teamName,
+					qualityGateJson: qualityGateJson || "{}",
+					leader: true,
+					runtime: runtime.parallelRuntime,
+				});
 				return {
 					status: 0,
-					stdout: renderCompleteHandoff(
-						await startNextUltragoalGoal({ cwd, retryFailed: hasFlag(args, "--retry-failed") }),
-						json,
-						cwd,
-					),
+					stdout: renderCheckpointContinuation(checkpoint, checkpoint.checkpointedGoal.status, json, cwd),
 				};
+			}
+			case "join-parallel-group": {
+				const goalId = flagValue(args, "--goal-id") ?? "";
+				const teamName = flagValue(args, "--team-name") ?? "";
+				if (!goalId || !teamName) throw new Error("join-parallel-group requires --goal-id and --team-name");
+				const result = await checkpointUltragoalParallelGroup({
+					cwd,
+					goalId,
+					teamName,
+					qualityGateJson: flagValue(args, "--quality-gate-json") ?? "",
+					leader: hasFlag(args, "--leader"),
+					runtime: runtime.parallelRuntime,
+				});
+				return {
+					status: 0,
+					stdout: renderCheckpointContinuation(result, result.checkpointedGoal.status, json, cwd),
+				};
+			}
 			case "checkpoint": {
 				const goalId = flagValue(args, "--goal-id") ?? "";
 				const status = parseGoalStatus(flagValue(args, "--status"));
@@ -5643,6 +6175,7 @@ const RECONCILE_COMMANDS = new Set([
 	"create",
 	"create-goals",
 	"complete-goals",
+	"join-parallel-group",
 	"checkpoint",
 	"steer",
 	"record-review-blockers",
@@ -5740,9 +6273,13 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 	}
 }
 
-export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+export async function runNativeUltragoalCommand(
+	args: string[],
+	cwd = process.cwd(),
+	runtime: UltragoalCommandRuntime = {},
+): Promise<UltragoalCommandResult> {
 	const command = commandName(args);
-	const result = await dispatchUltragoalCommand(args, cwd);
+	const result = await dispatchUltragoalCommand(args, cwd, runtime);
 	const isHelp = args.some(isHelpArg) || args[0] === "help";
 	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
 		await reconcileUltragoalState(cwd);

@@ -20,6 +20,7 @@ import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
+	sanitizeLifecycleResponse,
 } from "./lifecycle-ledger";
 import { type IndexedSession, SessionIndex } from "./session-index";
 import { BrokerTransport } from "./transport";
@@ -227,6 +228,23 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
+}
+function lifecycleEndpointGeneration(response: BrokerResponse): number | undefined {
+	if (!response.ok || response.result === null || typeof response.result !== "object") return undefined;
+	const result = response.result as Record<string, unknown>;
+	const endpoint = result.endpoint;
+	const generation =
+		result.endpointGeneration ??
+		(endpoint !== null && typeof endpoint === "object"
+			? (endpoint as Record<string, unknown>).endpointGeneration
+			: undefined);
+	return typeof generation === "number" && Number.isSafeInteger(generation) && generation > 0 ? generation : undefined;
+}
+
+function hasLifecycleEndpoint(response: unknown): boolean {
+	if (response === null || typeof response !== "object") return false;
+	const result = (response as { result?: unknown }).result;
+	return result !== null && typeof result === "object" && (result as Record<string, unknown>).endpoint !== undefined;
 }
 
 function lifecycleTarget(operation: string, input: Record<string, unknown>): unknown {
@@ -576,7 +594,23 @@ export class Broker {
 		await prev;
 		try {
 			const begun = await this.ledger.begin(identity, requestHash);
-			if (begun.kind === "replay") return begun.entry.response as BrokerResponse;
+			if (begun.kind === "replay") {
+				const replay = begun.entry.response as BrokerResponse;
+				if (!hasLifecycleEndpoint(replay)) return replay;
+				if (!begun.entry.resultSessionId || !begun.entry.endpointGeneration)
+					return error("endpoint_stale", "lifecycle endpoint authority is unavailable");
+				const currentEndpoint = await this.#endpoint({
+					sessionId: begun.entry.resultSessionId,
+					endpointGeneration: begun.entry.endpointGeneration,
+				});
+				if (!currentEndpoint.ok) return currentEndpoint;
+				const result = replay.ok && replay.result && typeof replay.result === "object" ? replay.result : {};
+				return {
+					...replay,
+					ok: true,
+					result: { ...(result as Record<string, unknown>), endpoint: currentEndpoint.result },
+				};
+			}
 			if (begun.kind === "idempotency_conflict")
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			if (begun.kind === "terminal_uncertain")
@@ -586,6 +620,20 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
+			const durableResponse = sanitizeLifecycleResponse(response) as BrokerResponse;
+			let endpointGeneration = lifecycleEndpointGeneration(response);
+			if (hasLifecycleEndpoint(response) && endpointGeneration === undefined && response.ok) {
+				const sessionId =
+					typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+						? (response.result as { sessionId: string }).sessionId
+						: undefined;
+				if (sessionId) {
+					await this.index.refresh();
+					endpointGeneration = this.index
+						.listSessions()
+						.sessions.find(session => session.sessionId === sessionId && session.live)?.endpointGeneration;
+				}
+			}
 			await this.ledger.transition(
 				identity,
 				response.ok
@@ -598,18 +646,19 @@ export class Broker {
 						response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 							? (response.result as { sessionId: string }).sessionId
 							: undefined,
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					...(endpointGeneration !== undefined ? { endpointGeneration } : {}),
+					response: durableResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(durableResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				},
 			);
 			const reopenedLedger = await new LifecycleLedger(this.settings.agentDir).open();
 			const persisted = reopenedLedger.get(identity);
-			const expectedResponseDigest = createHash("sha256").update(canonicalJson(response)).digest("hex");
+			const expectedResponseDigest = createHash("sha256").update(canonicalJson(durableResponse)).digest("hex");
 			const persistenceVerified =
 				persisted?.responseDigest === expectedResponseDigest &&
-				canonicalJson(persisted.response) === canonicalJson(response) &&
+				canonicalJson(persisted.response) === canonicalJson(durableResponse) &&
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
 			if (!persistenceVerified) {

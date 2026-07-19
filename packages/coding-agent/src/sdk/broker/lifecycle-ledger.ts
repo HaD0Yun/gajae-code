@@ -96,6 +96,25 @@ function canonicalJson(value: unknown): string {
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
 }
+/**
+ * Removes the ephemeral endpoint credential from a lifecycle response before it
+ * crosses the durable ledger boundary.
+ */
+export function sanitizeLifecycleResponse(response: unknown): unknown {
+	if (response === null || typeof response !== "object") return response;
+	const result = (response as { result?: unknown }).result;
+	if (result === null || typeof result !== "object") return response;
+	const endpoint = (result as { endpoint?: unknown }).endpoint;
+	if (endpoint === null || typeof endpoint !== "object" || !("token" in endpoint)) return response;
+	const { token: _token, ...sanitizedEndpoint } = endpoint as Record<string, unknown>;
+	return {
+		...(response as Record<string, unknown>),
+		result: {
+			...(result as Record<string, unknown>),
+			endpoint: sanitizedEndpoint,
+		},
+	};
+}
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	if (!terminal(entry.state) && entry.state !== "terminal_uncertain") return true;
@@ -247,6 +266,7 @@ export class LifecycleLedger {
 		const previous = this.#byIdentity.get(identity);
 		if (!previous) throw new Error("Unknown lifecycle identity");
 		const next = { ...previous, ...fields, state, ts: Date.now() };
+		if (fields.response !== undefined) next.response = sanitizeLifecycleResponse(fields.response);
 		if (
 			(terminal(state) || state === "terminal_uncertain") &&
 			next.response !== undefined &&

@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-19T00:00:00Z",
+  "focusedTests": {
+    "command": "bun test packages/coding-agent/test/gjc-runtime/ralplan-runtime.test.ts packages/coding-agent/test/gjc-runtime/team-runtime.test.ts packages/coding-agent/test/gjc-runtime/team-headless-control-plane.test.ts packages/coding-agent/test/gjc-runtime/team-tmux-control-plane.test.ts packages/coding-agent/test/gjc-runtime/team-watch.test.ts packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts packages/coding-agent/test/default-gjc-definitions.test.ts",
+    "passed": 327,
+    "failed": 0,
+    "expectations": 1737
+  },
+  "coordinatorTests": {
+    "command": "bun test packages/coding-agent/test/coordinator-mcp-server.test.ts packages/coding-agent/test/coordinator-mcp-policy.test.ts packages/coding-agent/test/coordinator-mcp.test.ts",
+    "passed": 43,
+    "failed": 0,
+    "expectations": 161
+  },
+  "repositoryGates": {
+    "checkVisibleDefinitions": "passed",
+    "verifyG002Gates": "passed",
+    "rebrandInventoryStrict": "passed",
+    "defaultGjcDefinitions": "24 passed, 0 failed",
+    "checkTs": "passed",
+    "packageSuite": "10824 passed, 352 skipped, 7 failed, 3 errors; three failures are active-Ultragoal environment contamination and pass with GJC_SESSION_ID/GJC_SESSION_FILE unset, while the remaining session identity, tmux timeout, and /tmp canonicalization failures are unrelated to the changed feature surfaces"
+  },
+  "productionBrokerLifecycle": {
+    "test": "uses the production coordinator and broker lifecycle without tmux",
+    "status": "passed",
+    "tmuxAvailableInPath": false,
+    "productionSurfaces": ["createCoordinatorMcpServer", "Broker", "SDK session host", "HeadlessControlPlane", "startGjcTeam", "resumeGjcTeam", "shutdownGjcTeam"],
+    "scriptedBoundary": "GJC_SDK_SESSION_COMMAND launches a temp wrapper around the shipped runSessionHost and removes only the startup body",
+    "assertions": ["spawn and canonical readiness", "delivery through production coordinator", "real host process termination", "forced stale-endpoint reap", "authoritative dead probe", "claim release", "replacement generation", "new-token reclaim", "task completion", "terminal phase complete", "failed=0", "initial and replacement SDK tokens differ", "each generated SDK token absent from every other discovery file, persisted state byte, and captured output byte"]
+  },
+  "automaticParallelLifecycle": {
+    "test": "runs the automatic production headless parallel lifecycle through join and checkpoint",
+    "status": "passed",
+    "tmuxAvailableInPath": false,
+    "assertions": ["automatic complete-goals launch", "production coordinator and broker startup", "production SDK worker readiness and delivery", "terminal task receipt", "strict leader join", "durable goal checkpoint", "worker reap", "final aggregate completion"]
+  },
+  "demo": {
+    "command": "bun packages/coding-agent/scripts/demo-headless-team.ts",
+    "assertionsPassed": 11,
+    "assertionsFailed": 0,
+    "capture": "docs/assets/team-watch-demo.txt",
+    "captureSha256": "8729f58acb804f575597f980d77e95577534fb0ff9b4db78dbb275e04011c0aa"
+  },
+  "watchCli": {
+    "team": "lane-a-build-work-lane-b-verif-16fb5398",
+    "jsonSnapshot": "passed",
+    "plainOnce": "passed",
+    "pty": { "durationSeconds": 1.1, "frames": 6, "ansiClears": 6, "exitSignal": 15 },
+    "readOnlyBeforeSha256": "637d568513fb3c4af17b0aae5d1a77502c18553565eca2b87311a5133cbd7303",
+    "readOnlyAfterSha256": "637d568513fb3c4af17b0aae5d1a77502c18553565eca2b87311a5133cbd7303"
+  },
+  "evidenceBoundary": {
+    "realExternalCoordinatorLifecycle": "exercised with production coordinator, broker, SDK host, and runtime using a deterministic offline prompt-acceptance boundary",
+    "parallelUltragoalRuntime": "direct automatic complete-goals launch, production headless Team lifecycle, strict join, durable checkpoint, reap, and aggregate completion are exercised in one integration test",
+    "packageSuiteGreen": false
+  }
+}

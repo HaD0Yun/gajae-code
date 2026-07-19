@@ -21,6 +21,9 @@ import {
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import type { DeliveryReceipt, TeamControlPlane, WorkerHandle, WorkerProbe } from "./team-control-plane";
+import { createHeadlessTeamControlPlane } from "./team-control-plane-headless";
+import { createTmuxTeamControlPlane } from "./team-control-plane-tmux";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
@@ -41,6 +44,7 @@ export type GjcTeamWorkerLifecycleState =
 	| "draining"
 	| "stopped"
 	| "failed"
+	| "unavailable"
 	| "unknown";
 export type GjcTeamShutdownMode = "graceful" | "force" | "abort";
 
@@ -75,6 +79,13 @@ export interface GjcTeamWorker {
 	worktree_created?: boolean;
 	worktree_base_ref?: string;
 	team_state_root?: string;
+	control_plane?: "headless";
+	session_id?: string;
+	sdk_discovery_ref?: string;
+	sdk_endpoint_ref?: string;
+	spawn_generation?: number;
+	delivery_receipt?: DeliveryReceipt;
+	delegate_created?: boolean;
 }
 
 export interface GjcTeamTaskClaim {
@@ -156,6 +167,7 @@ export interface GjcTeamConfig {
 	workers: GjcTeamWorker[];
 	created_at: string;
 	updated_at: string;
+	control_plane?: "tmux" | "headless";
 }
 
 export type GjcTeamIntegrationStatus =
@@ -285,6 +297,7 @@ export interface GjcTeamSnapshotOptions {
 export interface GjcTeamStartOptions {
 	workerCount: number;
 	agentType: string;
+	agentTypes?: string[];
 	task: string;
 	teamName?: string;
 	worktreeMode?: GjcTeamWorktreeMode;
@@ -293,6 +306,7 @@ export interface GjcTeamStartOptions {
 	dryRun?: boolean;
 	platform?: NodeJS.Platform;
 	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
+	controlPlane?: TeamControlPlane;
 }
 
 export interface GjcTeamApiClaimResult {
@@ -1153,7 +1167,7 @@ function parseGjcTeamShutdownMode(value: unknown): GjcTeamShutdownMode {
 }
 
 function isGjcTeamWorkerLifecycleState(value: string): value is GjcTeamWorkerLifecycleState {
-	return ["starting", "ready", "working", "draining", "stopped", "failed", "unknown"].includes(value);
+	return ["starting", "ready", "working", "draining", "stopped", "failed", "unavailable", "unknown"].includes(value);
 }
 
 function parseGjcTeamWorkerLifecycleState(value: unknown): GjcTeamWorkerLifecycleState {
@@ -1323,7 +1337,11 @@ async function detectGjcTeamWorkerLivenessReasons(
 	if (lifecycle.lifecycle_state === "failed") appendLivenessRecoveryReason(reasons, "worker_lifecycle_failed");
 	if (lifecycle.lifecycle_state === "stopped") appendLivenessRecoveryReason(reasons, "worker_lifecycle_stopped");
 	if (isWorkerHeartbeatStale(worker, heartbeat, env)) appendLivenessRecoveryReason(reasons, "stale_heartbeat");
-	if (!config.dry_run && (!worker.pane_id?.startsWith("%") || !paneBelongsToTeamTarget(config, worker.pane_id)))
+	if (
+		config.control_plane !== "headless" &&
+		!config.dry_run &&
+		(!worker.pane_id?.startsWith("%") || !paneBelongsToTeamTarget(config, worker.pane_id))
+	)
 		appendLivenessRecoveryReason(reasons, "missing_pane");
 	return reasons;
 }
@@ -1647,11 +1665,7 @@ function roleValuesForWorker(worker: GjcTeamWorker): Set<string> {
 	return new Set([worker.role, worker.agent_type].map(value => value.trim()).filter(value => value.length > 0));
 }
 
-function getGjcTeamTaskClaimEligibilityReason(
-	task: GjcTeamTask,
-	worker: GjcTeamWorker,
-	tasks: GjcTeamTask[],
-): string | null {
+function getGjcTeamTaskClaimEligibilityReason(task: GjcTeamTask, worker: GjcTeamWorker): string | null {
 	if (task.status !== "pending") return `task_not_pending:${task.id}`;
 	if (task.owner && task.owner !== worker.id) return `task_owner_mismatch:${task.id}:${task.owner}`;
 	if (task.assignee && task.assignee !== worker.id) return `task_assignee_mismatch:${task.id}:${task.assignee}`;
@@ -1663,12 +1677,14 @@ function getGjcTeamTaskClaimEligibilityReason(
 		return `task_role_mismatch:${task.id}:${task.allowed_roles.join(",")}`;
 
 	if (task.blocked_by?.length) return `task_blocked:${task.id}:${task.blocked_by.join(",")}`;
+	return null;
+}
+
+function getGjcTeamTaskDependencyReason(task: GjcTeamTask, tasks: GjcTeamTask[]): string | null {
 	for (const dependencyId of task.depends_on ?? []) {
 		const dependency = tasks.find(candidate => candidate.id === dependencyId);
-		if (!dependency || !isGjcTeamTaskCompletionVerified(dependency))
-			return `task_dependency_incomplete:${task.id}:${dependencyId}`;
+		if (!dependency || !isGjcTeamTaskCompletionVerified(dependency)) return `blocked_by_dependency:${dependencyId}`;
 	}
-
 	return null;
 }
 
@@ -1730,15 +1746,20 @@ async function findTeamDir(
 		throw new Error(`ambiguous_team_name:${teamName}:${matches.map(match => match.team_name).join(",")}`);
 	throw new Error(`team_not_found:${teamName}`);
 }
-function buildWorkers(count: number, agentType: string, stateRoot?: string): GjcTeamWorker[] {
+function buildWorkers(
+	count: number,
+	agentType: string,
+	stateRoot?: string,
+	agentTypes?: readonly string[],
+): GjcTeamWorker[] {
 	return Array.from({ length: count }, (_, index) => {
 		const id = `worker-${index + 1}`;
 		return {
 			id,
 			name: id,
 			index: index + 1,
-			agent_type: agentType,
-			role: agentType,
+			agent_type: agentTypes?.[index] ?? agentType,
+			role: agentTypes?.[index] ?? agentType,
 			status: "starting",
 			last_heartbeat: now(),
 			assigned_tasks: [],
@@ -1815,7 +1836,7 @@ function parseWorktreeMode(args: string[]): { mode: GjcTeamWorktreeMode; remaini
 	return { mode, remainingArgs };
 }
 function resolveDefaultWorktreeMode(mode?: GjcTeamWorktreeMode): GjcTeamWorktreeMode {
-	return mode?.enabled ? mode : { enabled: true, detached: true, name: null };
+	return mode ?? { enabled: true, detached: true, name: null };
 }
 function branchExists(repoRoot: string, branchName: string): boolean {
 	return (
@@ -2148,6 +2169,7 @@ interface GjcTeamInitialLane {
 	label: string;
 	title: string;
 	body: string;
+	dependencyLabels: string[];
 }
 
 function normalizeLaneId(label: string): string {
@@ -2157,21 +2179,30 @@ function normalizeLaneId(label: string): string {
 function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
 	const lines = task.split(/\r?\n/);
 	const lanes: GjcTeamInitialLane[] = [];
-	let current: { label: string; title: string; body: string[] } | null = null;
-	const laneHeading = /^#{2,6}\s+Lane\s+([A-Za-z0-9]+)\s*(?:[—–-]\s*(.+))?\s*$/;
+	let current: { label: string; title: string; body: string[]; dependencyLabels: string[] } | null = null;
+	const laneHeading = /^###\s+Lane\s+([A-Za-z0-9]+)\s+—\s+(.+?)\s*$/i;
+	const laneHeadingWithDependencies = /^###\s+Lane\s+([A-Za-z0-9]+)\s+—\s+(.+?)\s+\(after:\s*([^)]+)\)\s*$/i;
+	const laneHeadingLike = /^#{2,6}\s+Lane\s+[A-Za-z0-9]+\b/i;
 	const boundaryHeading = /^#{1,6}\s+(?:Integration Owner|Verification Plan|ADR|Approval State)\b/i;
 
 	for (const line of lines) {
-		const match = line.match(laneHeading);
+		const dependencyMatch = line.match(laneHeadingWithDependencies);
+		const match = dependencyMatch ?? line.match(laneHeading);
+		if (match && !dependencyMatch && /\(after:/i.test(match[2] ?? "")) throw new Error("invalid_team_lane_heading");
 		if (match) {
 			if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
 			current = {
 				label: match[1] ?? `${lanes.length + 1}`,
 				title: (match[2] ?? `Lane ${match[1] ?? lanes.length + 1}`).trim(),
 				body: [],
+				dependencyLabels: (dependencyMatch?.[3] ?? "")
+					.split(",")
+					.map(label => label.trim())
+					.filter(label => label.length > 0),
 			};
 			continue;
 		}
+		if (laneHeadingLike.test(line)) throw new Error("invalid_team_lane_heading");
 		if (current && boundaryHeading.test(line)) {
 			lanes.push({ ...current, body: current.body.join("\n").trim() });
 			current = null;
@@ -2191,7 +2222,33 @@ function hasAmbiguousLaneSplitIntent(task: string): boolean {
 
 function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[] {
 	const lanes = parseExplicitTeamLanes(task);
-	if (lanes.length > 0)
+	if (lanes.length > 0) {
+		const canonicalLabels = new Set<string>();
+		for (const lane of lanes) {
+			const canonicalLabel = lane.label.toLowerCase();
+			if (canonicalLabels.has(canonicalLabel)) throw new Error(`duplicate_team_lane_label:${lane.label}`);
+			canonicalLabels.add(canonicalLabel);
+		}
+		const taskIdByLabel = new Map(lanes.map((lane, index) => [lane.label.toLowerCase(), `task-${index + 1}`]));
+		const dependencies = lanes.map((lane, index) => {
+			const taskId = `task-${index + 1}`;
+			const dependsOn = lane.dependencyLabels.map(label => taskIdByLabel.get(label.toLowerCase()));
+			if (dependsOn.some(dependencyId => !dependencyId) || dependsOn.includes(taskId))
+				throw new Error(`invalid_lane_dependency:${taskId}`);
+			return dependsOn as string[];
+		});
+		const visiting = new Set<string>();
+		const visited = new Set<string>();
+		const visit = (taskId: string): void => {
+			if (visiting.has(taskId)) throw new Error("lane_dependency_cycle");
+			if (visited.has(taskId)) return;
+			visiting.add(taskId);
+			for (const dependencyId of dependencies[Number(taskId.slice("task-".length)) - 1] ?? []) visit(dependencyId);
+			visiting.delete(taskId);
+			visited.add(taskId);
+		};
+		for (let index = 0; index < lanes.length; index += 1) visit(`task-${index + 1}`);
+
 		return lanes.map((lane, index) => {
 			const worker = workers[index % workers.length];
 			if (!worker) throw new Error("team_lane_requires_worker");
@@ -2207,11 +2264,13 @@ function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[
 				owner: worker.id,
 				lane: normalizeLaneId(lane.label),
 				required_role: worker.role,
+				depends_on: dependencies[index]?.length ? dependencies[index] : undefined,
 				version: 1,
 				created_at: now(),
 				updated_at: now(),
 			};
 		});
+	}
 
 	if (workers.length > 1 && hasAmbiguousLaneSplitIntent(task))
 		throw new Error(
@@ -3032,12 +3091,162 @@ async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promi
 	await writeJsonFile(mailboxPath(dir, "leader-fixed"), { messages: [] });
 }
 
+async function startHeadlessWorkers(
+	config: GjcTeamConfig,
+	tasks: GjcTeamTask[],
+	controlPlane: TeamControlPlane,
+	dryRun: boolean,
+): Promise<GjcTeamWorker[]> {
+	const workers: GjcTeamWorker[] = [];
+	const spawnedHandles: WorkerHandle[] = [];
+	try {
+		for (const worker of config.workers) {
+			const prompt = tasks.find(task => task.owner === worker.id)?.objective ?? config.task;
+			if (dryRun) {
+				workers.push({
+					...worker,
+					control_plane: "headless",
+					session_id: `dry-run-${worker.id}`,
+					sdk_endpoint_ref: `dry-run/${worker.id}`,
+					sdk_discovery_ref: `dry-run/${worker.id}`,
+					spawn_generation: 1,
+					delegate_created: true,
+				});
+				continue;
+			}
+			const generation = (worker.spawn_generation ?? 0) + 1;
+			const spawned = await controlPlane.spawnWorker({
+				id: worker.id,
+				cwd: worker.worktree_path ?? config.leader.cwd,
+				prompt,
+				generation,
+			});
+			spawnedHandles.push(spawned.handle);
+			await controlPlane.awaitReady(spawned.handle, 30_000);
+			const delivery = await controlPlane.deliver(spawned.handle, {
+				workerId: worker.id,
+				prompt,
+				idempotencyKey: `team-delivery:${config.team_name}:${worker.id}:${generation}:${spawned.handle.sessionId}`,
+			});
+			workers.push({
+				...worker,
+				control_plane: "headless",
+				session_id: spawned.handle.sessionId,
+				sdk_endpoint_ref: spawned.handle.discoveryRef,
+				sdk_discovery_ref: spawned.handle.discoveryRef,
+				spawn_generation: generation,
+				delivery_receipt: delivery,
+				delegate_created: spawned.handle.createdByDelegate,
+			});
+		}
+		return workers;
+	} catch (error) {
+		await Promise.allSettled(spawnedHandles.map(handle => controlPlane.stopWorker(handle, "force")));
+		throw error;
+	}
+}
+
+function createRuntimeTmuxControlPlane(
+	config: GjcTeamConfig,
+	dir: string,
+	dryRun: boolean,
+	env: NodeJS.ProcessEnv,
+): TeamControlPlane {
+	let launch: Promise<GjcTeamWorker[]> | undefined;
+	const launched = () => (launch ??= startTmuxSession(config, dir, dryRun, env));
+	const probe = async (handle: WorkerHandle) => ({
+		workerId: handle.workerId,
+		sessionId: handle.sessionId,
+		live: dryRun || paneBelongsToTeamTarget(config, handle.sessionId),
+		state: dryRun || paneBelongsToTeamTarget(config, handle.sessionId) ? "running" : "stopped",
+	});
+	return createTmuxTeamControlPlane({
+		async spawn(spec) {
+			const worker = (await launched()).find(candidate => candidate.id === spec.id);
+			if (!worker?.pane_id) throw new Error(`tmux_worker_missing_pane:${config.tmux_target}:${spec.id}`);
+			return {
+				handle: {
+					workerId: spec.id,
+					sessionId: worker.pane_id,
+					controlPlane: "tmux",
+					createdByDelegate: true,
+				},
+				delivery: {
+					workerId: spec.id,
+					sessionId: worker.pane_id,
+					turnId: worker.pane_id,
+					accepted: true,
+					queued: false,
+					status: "delivering",
+				},
+			};
+		},
+		async awaitReady() {},
+		async deliver(handle, assignment) {
+			const live = dryRun || paneBelongsToTeamTarget(config, handle.sessionId);
+			return {
+				workerId: handle.workerId,
+				sessionId: handle.sessionId,
+				turnId: assignment.idempotencyKey,
+				accepted: live,
+				queued: false,
+				status: live ? "delivered-by-spawn" : "failed",
+			};
+		},
+		probe,
+		async stop(handle) {
+			if (!handle.sessionId.startsWith("%") || !paneBelongsToTeamTarget(config, handle.sessionId)) return false;
+			const result = Bun.spawnSync([config.tmux_command, "kill-pane", "-t", handle.sessionId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			return result.exitCode === 0;
+		},
+	});
+}
+
+async function startTmuxWorkersThroughControlPlane(
+	config: GjcTeamConfig,
+	tasks: GjcTeamTask[],
+	controlPlane: TeamControlPlane,
+): Promise<GjcTeamWorker[]> {
+	const workers: GjcTeamWorker[] = [];
+	for (const worker of config.workers) {
+		const prompt = tasks.find(task => task.owner === worker.id)?.objective ?? config.task;
+		const spawned = await controlPlane.spawnWorker({
+			id: worker.id,
+			cwd: worker.worktree_path ?? config.leader.cwd,
+			prompt,
+		});
+		await controlPlane.awaitReady(spawned.handle, 30_000);
+		workers.push({ ...worker, pane_id: spawned.handle.sessionId });
+	}
+	return workers;
+}
+
+function headlessWorkerHandle(worker: GjcTeamWorker): WorkerHandle | null {
+	if (!worker.session_id) return null;
+	return {
+		workerId: worker.id,
+		sessionId: worker.session_id,
+		controlPlane: "headless",
+		discoveryRef: worker.sdk_endpoint_ref ?? worker.sdk_discovery_ref,
+		createdByDelegate: worker.delegate_created === true,
+	};
+}
+export function resolveGjcTeamControlPlaneKind(env: NodeJS.ProcessEnv = process.env): "tmux" | "headless" {
+	return env.GJC_TEAM_BACKEND === "headless" ? "headless" : "tmux";
+}
+
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	const cwd = options.cwd ?? process.cwd();
 	const env = options.env ?? process.env;
+	const headless = resolveGjcTeamControlPlaneKind(env) === "headless";
 	if (options.mailboxDeliveryTransport) setGjcTeamMailboxDeliveryTransport(options.mailboxDeliveryTransport);
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
+	if (options.agentTypes && options.agentTypes.length !== options.workerCount)
+		throw new Error("invalid_team_agent_types:expected_one_role_per_worker");
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
 	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
 	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
@@ -3046,12 +3255,14 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const createdAt = now();
 	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
 	const platform = options.platform ?? process.platform;
-	const tmuxBinary = resolveGjcTmuxBinary({ env, platform });
+	const tmuxBinary = headless ? { command: "", isPsmux: false } : resolveGjcTmuxBinary({ env, platform });
 	const tmuxCommand = tmuxBinary.command;
-	const tmuxContext = options.dryRun
-		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
-		: readCurrentTmuxLeaderContext(tmuxCommand, env);
-	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
+	const tmuxContext = headless
+		? { sessionName: "", windowIndex: "", leaderPaneId: "", target: "" }
+		: options.dryRun
+			? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
+			: readCurrentTmuxLeaderContext(tmuxCommand, env);
+	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot, options.agentTypes);
 	const initialTasks = buildInitialTasks(options.task, initialWorkers);
 	const workers: GjcTeamWorker[] = [];
 	try {
@@ -3088,6 +3299,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		workers,
 		created_at: createdAt,
 		updated_at: createdAt,
+		control_plane: headless ? "headless" : undefined,
 	};
 	await initializeStateDirs(dir, config.workers);
 	await writeJsonFile(path.join(dir, "config.json"), config);
@@ -3106,6 +3318,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		workers: config.workers,
 		workspace_mode: config.workspace_mode,
 		dry_run: config.dry_run,
+		control_plane: config.control_plane,
 		created_at: createdAt,
 		updated_at: createdAt,
 	});
@@ -3134,29 +3347,69 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 			dry_run: config.dry_run,
 		},
 	});
-	let tmuxWorkers: GjcTeamWorker[];
+	let launchedWorkers: GjcTeamWorker[];
 	try {
-		tmuxWorkers = await startTmuxSession(config, dir, options.dryRun ?? false, env);
+		const controlPlane =
+			options.controlPlane ??
+			(headless
+				? createHeadlessTeamControlPlane({ env, allowedWorkdir: cwd })
+				: createRuntimeTmuxControlPlane(config, dir, options.dryRun ?? false, env));
+		launchedWorkers = headless
+			? await startHeadlessWorkers(config, initialTasks, controlPlane, options.dryRun ?? false)
+			: await startTmuxWorkersThroughControlPlane(config, initialTasks, controlPlane);
 	} catch (error) {
 		await writePhase(dir, "failed");
 		await appendEvent(dir, {
 			type: "team_start_failed",
 			message: error instanceof Error ? error.message : String(error),
 		});
-		killWorkerPanes(config);
+		if (!headless) killWorkerPanes(config);
 		await rollbackCreatedWorktrees(config.workers);
 		throw error;
 	}
 	const runningConfig = {
 		...config,
-		workers: tmuxWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: now() })),
+		workers: launchedWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: now() })),
 		updated_at: now(),
 	};
 	await writeJsonFile(path.join(dir, "config.json"), runningConfig);
-	await writeWorkerLifecycleForConfig(dir, runningConfig, "starting", worker => ({
-		pane_id: worker.pane_id,
-		started_at: runningConfig.created_at,
-	}));
+	if (headless)
+		await writeJsonFile(path.join(dir, "manifest.v2.json"), {
+			version: 2,
+			team_name: runningConfig.team_name,
+			display_name: runningConfig.display_name,
+			requested_name: runningConfig.requested_name,
+			tmux_session: runningConfig.tmux_session,
+			tmux_session_name: runningConfig.tmux_session_name,
+			tmux_target: runningConfig.tmux_target,
+			worker_command: runningConfig.worker_command,
+			worker_cli_plan: runningConfig.worker_cli_plan,
+			tmux_command: runningConfig.tmux_command,
+			leader: runningConfig.leader,
+			workers: runningConfig.workers,
+			workspace_mode: runningConfig.workspace_mode,
+			dry_run: runningConfig.dry_run,
+			control_plane: runningConfig.control_plane,
+			created_at: runningConfig.created_at,
+			updated_at: runningConfig.updated_at,
+		});
+	if (headless)
+		for (const worker of runningConfig.workers)
+			await writeJsonFile(path.join(workerDir(dir, worker.id), "identity.json"), worker);
+	if (headless) {
+		const lifecycle = await readWorkerLifecycleById(dir, runningConfig);
+		for (const worker of runningConfig.workers) {
+			if (lifecycle[worker.id]?.lifecycle_state === "ready") continue;
+			await writeWorkerLifecycleRecord(dir, worker, "starting", {
+				pane_id: worker.pane_id,
+				started_at: runningConfig.created_at,
+			});
+		}
+	} else
+		await writeWorkerLifecycleForConfig(dir, runningConfig, "starting", worker => ({
+			pane_id: worker.pane_id,
+			started_at: runningConfig.created_at,
+		}));
 	await writePhase(dir, "running");
 	return readGjcTeamSnapshot(teamName, cwd, env);
 }
@@ -3482,11 +3735,111 @@ async function computeLifecycleNudges(
 		}
 	}
 }
+export async function resumeGjcTeam(
+	teamName: string,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+	controlPlane?: TeamControlPlane,
+): Promise<GjcTeamSnapshot> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	const config = await readConfig(dir);
+	if (config.control_plane !== "headless") return readGjcTeamSnapshot(teamName, cwd, env);
+	const plane = controlPlane ?? createHeadlessTeamControlPlane({ env, allowedWorkdir: config.leader.cwd });
+	const tasks = await readTasks(dir);
+	const workers: GjcTeamWorker[] = [];
+	const liveByWorker = new Map<string, boolean>();
+	for (const worker of config.workers) {
+		const handle = headlessWorkerHandle(worker);
+		let probe: WorkerProbe | null = null;
+		if (handle) {
+			try {
+				probe = await plane.probe(handle);
+			} catch {
+				probe = null;
+			}
+		}
+		if (probe?.liveness !== "dead") {
+			workers.push({
+				...worker,
+				...(probe?.liveness === "alive" ? { status: "idle" as const, last_heartbeat: now() } : {}),
+			});
+			liveByWorker.set(worker.id, probe?.liveness === "alive");
+			continue;
+		}
+		if (!handle?.createdByDelegate)
+			throw new Error(`headless_resume_stale_session_not_delegate_created:${worker.id}`);
+		const reaped = await plane.stopWorker(handle, "force");
+		if (!reaped) throw new Error(`headless_resume_force_reap_failed:${worker.id}`);
+		const confirmed = await plane.probe(handle);
+		if (confirmed.liveness !== "dead")
+			throw new Error(`headless_resume_death_not_confirmed:${worker.id}:${confirmed.liveness ?? "unknown"}`);
+		for (const task of tasks) {
+			if (task.status !== "in_progress" || task.claim?.owner !== worker.id) continue;
+			await releaseGjcTeamTaskClaim(teamName, task.id, task.claim.token, worker.id, cwd, env);
+		}
+		const prompt = tasks.find(task => task.owner === worker.id)?.objective ?? config.task;
+		const generation = (worker.spawn_generation ?? 1) + 1;
+		const spawned = await plane.spawnWorker({
+			id: worker.id,
+			cwd: worker.worktree_path ?? config.leader.cwd,
+			prompt,
+			generation,
+		});
+		await plane.awaitReady(spawned.handle, 30_000);
+		const delivery = await plane.deliver(spawned.handle, {
+			workerId: worker.id,
+			prompt,
+			idempotencyKey: `team-delivery:${config.team_name}:${worker.id}:${generation}:${spawned.handle.sessionId}`,
+		});
+		workers.push({
+			...worker,
+			status: "idle",
+			last_heartbeat: now(),
+			session_id: spawned.handle.sessionId,
+			sdk_endpoint_ref: spawned.handle.discoveryRef,
+			sdk_discovery_ref: spawned.handle.discoveryRef,
+			spawn_generation: generation,
+			delivery_receipt: delivery,
+			delegate_created: spawned.handle.createdByDelegate,
+		});
+		liveByWorker.set(worker.id, true);
+		await writeJsonFile(path.join(workerDir(dir, worker.id), "identity.json"), workers.at(-1));
+		await appendEvent(dir, {
+			type: "worker_resumed",
+			worker: worker.id,
+			message: `Respawned headless worker ${worker.id}`,
+			data: { previous_session_id: worker.session_id, session_id: spawned.handle.sessionId, generation },
+		});
+	}
+	const updated: GjcTeamConfig = {
+		...config,
+		workers,
+		updated_at: now(),
+	};
+	await writeJsonFile(path.join(dir, "config.json"), updated);
+	const manifestPath = path.join(dir, "manifest.v2.json");
+	const manifest = await readJsonFile<Record<string, unknown>>(manifestPath);
+	if (manifest)
+		await writeJsonFile(manifestPath, {
+			...manifest,
+			workers: updated.workers,
+			updated_at: updated.updated_at,
+		});
+	for (const worker of updated.workers) {
+		const available = liveByWorker.get(worker.id) === true;
+		await writeWorkerLifecycleRecord(dir, worker, available ? "ready" : "unavailable", {
+			started_at: updated.created_at,
+			stop_reason: available ? undefined : "headless_session_unavailable",
+		});
+	}
+	return readGjcTeamSnapshot(teamName, cwd, env);
+}
 
 export async function shutdownGjcTeam(
 	teamName: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
+	controlPlane?: TeamControlPlane,
 ): Promise<GjcTeamSnapshot> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
@@ -3516,7 +3869,37 @@ export async function shutdownGjcTeam(
 	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
 	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
 	const pendingIntegration = completionVerified ? await hasPendingGjcTeamIntegration(dir, config, monitor) : false;
-	killWorkerPanes(config);
+	if (config.control_plane === "headless") {
+		const plane = controlPlane ?? createHeadlessTeamControlPlane({ env, allowedWorkdir: config.leader.cwd });
+		await Promise.all(
+			config.workers.map(async worker => {
+				const handle = headlessWorkerHandle(worker);
+				if (!handle) throw new Error(`headless_shutdown_missing_handle:${worker.id}`);
+				const probe = await plane.probe(handle);
+				if (probe.activeTurnId) throw new Error(`headless_shutdown_active_turn:${worker.id}:${probe.activeTurnId}`);
+				if (probe.liveness === "unknown")
+					throw new Error(`headless_shutdown_liveness_unknown:${worker.id}:${probe.state}`);
+				if (probe.liveness === "alive" && !(await plane.stopWorker(handle, "graceful")))
+					throw new Error(`headless_shutdown_stop_failed:${worker.id}`);
+			}),
+		);
+	} else {
+		const plane = controlPlane ?? createRuntimeTmuxControlPlane(config, dir, false, env);
+		await Promise.all(
+			config.workers.map(async worker => {
+				if (!worker.pane_id) return;
+				await plane.stopWorker(
+					{
+						workerId: worker.id,
+						sessionId: worker.pane_id,
+						controlPlane: "tmux",
+						createdByDelegate: true,
+					},
+					"graceful",
+				);
+			}),
+		);
+	}
 	await removeCleanCreatedWorktrees(config.workers);
 	const stopped = {
 		...config,
@@ -3668,12 +4051,18 @@ export async function claimGjcTeamTask(
 	const tasks = await readTasks(dir);
 	const task = taskId
 		? tasks.find(candidate => candidate.id === taskId)
-		: tasks.find(candidate => getGjcTeamTaskClaimEligibilityReason(candidate, teamWorker, tasks) == null);
+		: tasks.find(
+				candidate =>
+					getGjcTeamTaskClaimEligibilityReason(candidate, teamWorker) == null &&
+					getGjcTeamTaskDependencyReason(candidate, tasks) == null,
+			);
 	if (!task) return { ok: false, reason: taskId ? `task_not_found:${taskId}` : "no_pending_task" };
-	const eligibilityReason = getGjcTeamTaskClaimEligibilityReason(task, teamWorker, tasks);
+	const eligibilityReason = getGjcTeamTaskClaimEligibilityReason(task, teamWorker);
 	if (eligibilityReason) return { ok: false, reason: eligibilityReason };
 	const activeClaimReason = await getActiveClaimReason(dir, task);
 	if (activeClaimReason) return { ok: false, reason: activeClaimReason };
+	const dependencyReason = getGjcTeamTaskDependencyReason(task, tasks);
+	if (dependencyReason) return { ok: false, reason: dependencyReason };
 	const token = randomUUID();
 	const claim: GjcTeamTaskClaim = {
 		owner: workerId,
@@ -3684,7 +4073,9 @@ export async function claimGjcTeamTask(
 	const created = await writeJsonFileNoClobber(claimPath, claim);
 	if (!created) return { ok: false, reason: `task_already_claimed:${task.id}` };
 	const current = await readGjcTeamTask(teamName, task.id, cwd, env);
-	const currentEligibilityReason = getGjcTeamTaskClaimEligibilityReason(current, teamWorker, await readTasks(dir));
+	const currentEligibilityReason =
+		getGjcTeamTaskClaimEligibilityReason(current, teamWorker) ??
+		getGjcTeamTaskDependencyReason(current, await readTasks(dir));
 	if (currentEligibilityReason) {
 		await fs.rm(claimPath, { force: true });
 		return { ok: false, reason: currentEligibilityReason };
@@ -4729,5 +5120,11 @@ export function parseTeamLaunchArgs(argv: string[]): GjcTeamStartOptions {
 	if (!task) throw new Error("missing_team_task");
 	if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
-	return { workerCount, agentType, task, dryRun, worktreeMode: resolveDefaultWorktreeMode(parsedWorktree.mode) };
+	return {
+		workerCount,
+		agentType,
+		task,
+		dryRun,
+		worktreeMode: parsedWorktree.mode.enabled ? parsedWorktree.mode : { enabled: true, detached: true, name: null },
+	};
 }

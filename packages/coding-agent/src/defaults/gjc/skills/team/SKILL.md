@@ -1,15 +1,15 @@
 ---
 name: team
-description: Multi-worker GJC tmux team orchestration
+description: Multi-worker GJC team orchestration
 
 source: "forked from upstream team skill and rebranded for GJC"
 ---
 
 # Team Skill
 
-`$team` is the tmux-based multi-worker execution mode for GJC. It starts real GJC worker CLI sessions by splitting the current tmux leader window and coordinates them through `.gjc/_session-{sessionid}/state/team/...` files plus CLI team interop (`gjc team api ...`) and state files.
+`$team` is the multi-worker execution mode for GJC. The default backend starts visible GJC worker CLI sessions by splitting the current tmux leader window. The shipped headless backend starts SDK-backed workers without tmux when `GJC_TEAM_BACKEND=headless`. Both backends coordinate through `.gjc/_session-{sessionid}/state/team/...`, CLI interop (`gjc team api ...`), and the same durable task and lifecycle contracts.
 
-This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern. In GJC App or plain outside-tmux sessions, do not present `$team` / `gjc team` as directly available; launch GJC CLI from shell first, or stay on the nearest app-safe surface until the user explicitly wants the tmux runtime.
+This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern. In GJC App or plain outside-tmux sessions, do not present the default tmux backend as directly available. Standalone Team may explicitly select `GJC_TEAM_BACKEND=headless`; otherwise launch GJC CLI from shell or stay on the nearest app-safe surface.
 
 ## Corrupt current-session state recovery
 
@@ -18,8 +18,8 @@ When team detects its own current-session state is corrupt, tampered, unreadable
 ## Team vs Native Subagents
 
 - Use **GJC native subagents** for bounded, in-session parallelism where one leader thread can fan out a few independent subtasks and wait for them directly.
-- Use **`gjc team`** when you need durable visible tmux workers, shared task state, worker mailbox files, worktrees, explicit lifecycle control, or long-running execution that must survive beyond one local reasoning burst.
-- Native subagents can complement team execution, but they do **not** replace the tmux team runtime's stateful coordination contract.
+- Use **`gjc team`** when you need durable shared task state, worker mailbox files, worktrees, explicit lifecycle control, long-running execution, visible tmux workers, or SDK-backed headless workers.
+- Native subagents can complement team execution, but they do **not** replace the team runtime's stateful coordination contract.
 
 ## What This Skill Must Do
 
@@ -64,11 +64,21 @@ requiring a separate linked execution loop up front. GJC team supports current-w
 - **Escalation:** use a new explicit follow-up task only when later manual work still needs a persistent single-owner fix/verification loop.
 - **Deprecation:** nested team execution commands have been removed. Use plain `gjc team ...` for coordinated execution.
 
+### Backends, watch, and lifecycle
+
+- The default backend remains tmux. `GJC_TEAM_BACKEND=headless` selects the shipped SDK/broker control plane; worker config persists only the private SDK discovery reference, not endpoint credentials.
+- `gjc team watch <team-name> --plain` (or `--json`) renders the durable snapshot. Pending owner/assignee metadata is not an active claim: dependency-blocked work is shown with its blocked reason, and a claim appears only after the task transitions to `in_progress`.
+- An execution-plan sidecar is run-scoped publication metadata. It identifies the originating Ultragoal run and lanes; it is not Team ownership and cannot grant a worker checkpoint authority.
+- Automatic orchestration uses a strict lifecycle: launch eligible lanes, join every launched worker, collect terminal evidence, then let the leader integrate and checkpoint. Failed, unknown, or unjoined workers fail closed; force recovery is limited to an authoritative stale delegate.
+- The leader alone owns assignment changes, integration, Team shutdown, and any parent workflow state. Workers own only their live task claims and returned evidence.
+
 ### Team + Ultragoal bridge
 
-Use `$ultragoal` for durable leader-owned goal/ledger tracking and `$team` for parallel visible tmux execution lanes. When Team is launched with an active `.gjc/_session-{sessionid}/ultragoal/goals.json`, worker task/status context may include leader-owned Ultragoal context: `.gjc/_session-{sessionid}/ultragoal/goals.json`, `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`, the active goal id, GJC goal mode, and the `fresh_leader_goal_get_required` checkpoint policy.
+Use `$ultragoal` for durable leader-owned goal/ledger tracking and `$team` for independent coordinated execution lanes. Team defaults to visible tmux workers; standalone Team may explicitly select the headless backend. When Team is launched with an active `.gjc/_session-{sessionid}/ultragoal/goals.json`, worker task/status context may include leader-owned Ultragoal context: `.gjc/_session-{sessionid}/ultragoal/goals.json`, `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`, the active goal id, GJC goal mode, and the `fresh_leader_goal_get_required` checkpoint policy.
 
-Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `.gjc/_session-{sessionid}/ultragoal`, auto-launch Team from Ultragoal, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Ultragoal does not auto-launch Team and performs no hidden goal mutation. The leader uses terminal Team evidence plus the current-session active GJC goal snapshot and strict quality gate to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>`.
+Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `.gjc/_session-{sessionid}/ultragoal`, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team remains an independent workflow and is never itself a hidden Ultragoal scheduler. An Ultragoal leader may explicitly launch it, including the opt-in `GJC_ULTRAGOAL_PARALLEL` headless path, while retaining sole ownership of goals, joins, integration, and checkpoints. The leader uses terminal Team evidence plus the current-session active GJC goal snapshot and strict quality gate to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>`.
+Outside the explicit `GJC_ULTRAGOAL_PARALLEL` opt-in, Ultragoal does not auto-launch Team.
+Outside that explicit opt-in, Team is not auto-launched and Ultragoal performs no hidden goal mutation.
 
 ### Worker command override
 
@@ -82,21 +92,20 @@ GJC_TEAM_WORKER_COMMAND="bun packages/coding-agent/src/cli.ts" gjc team executor
 
 ## Preconditions
 
-Before running `$team`, confirm:
+Before running `$team`, confirm the common preconditions, then the selected backend's preconditions:
 
-1. `tmux` installed (`tmux -V`)
-2. Current leader session is inside tmux (`$TMUX` is set)
-3. `gjc` command resolves to the intended install/build
-4. If running repo-local `node bin/gjc.js ...`, run `npm run build` after `src` changes
-5. Check HUD pane count in the leader window and avoid duplicate `hud --watch` panes before split
+1. `gjc` command resolves to the intended install/build.
+2. If running repo-local `node bin/gjc.js ...`, run `npm run build` after `src` changes.
+3. For the default tmux backend: `tmux` is installed (`tmux -V`), the leader is inside tmux (`$TMUX` is set), and the leader window has no duplicate `hud --watch` panes.
+4. For standalone explicit headless Team: set `GJC_TEAM_BACKEND=headless`; tmux and a tmux leader session are not required.
 
-Suggested preflight:
+Suggested tmux-backend preflight:
 
 ```bash
 tmux list-panes -F '#{pane_id}\t#{pane_start_command}' | rg 'hud --watch' || true
 ```
 
-If duplicates exist, remove extras before `gjc team` to prevent HUD ending up in worker stack.
+If duplicates exist, remove extras before default-backend `gjc team` to prevent HUD ending up in worker stack. Skip this tmux-only check for explicit headless Team.
 
 ## Pre-context Intake Gate
 
@@ -140,10 +149,10 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
 
 ## Current Runtime Behavior (As Implemented)
 
-`gjc team` currently performs:
+`gjc team` currently performs the following shared lifecycle, with backend-specific launch mechanics:
 
 1. Parse args (`N`, `agent-type`, task), default to 3 workers, and cap workers at 20.
-2. Non-dry-run: detect the current tmux leader context with `display-message -p "#S:#I #{pane_id}"` before creating state or worktrees.
+2. Non-dry-run: select the backend. The default tmux backend detects the current leader context with `display-message -p "#S:#I #{pane_id}"`; explicit `GJC_TEAM_BACKEND=headless` uses the independent SDK/broker control plane without tmux.
 3. Initialize team state:
    - `.gjc/_session-{sessionid}/state/team/<team>/config.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/manifest.v2.json`
@@ -153,7 +162,7 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
    - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/lifecycle.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/heartbeat.json`
 4. Resolve the worker command from `GJC_TEAM_WORKER_COMMAND` or the active `gjc` entrypoint.
-5. Split the current tmux window like GJC team: worker 1 is split horizontally to the right of the leader, workers 2..N are vertically stacked in the right column, then `select-layout main-vertical` and `main-pane-width` keep leader-left/worker-right at roughly 50/50.
+5. Launch workers with the selected backend: tmux splits the current window with the leader left and workers stacked right; explicit headless starts SDK-backed workers without panes.
 6. Launch the worker with:
    - `GJC_TEAM_NAME=<team>`
    - `GJC_TEAM_WORKER_ID=worker-1`

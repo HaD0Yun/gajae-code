@@ -1,0 +1,66 @@
+=== two workers ===
+team: headless-demo
+phase: running
+tasks: pending=2 blocked=0 in_progress=0 completed=0 failed=0
+latest event: team_started: Created native gjc team dry-run state without starting tmux workers
+workers:
+- worker-1 role=executor lifecycle=starting claim=none title=Lane A — Prepare shared input task_status=pending reason=none heartbeat=10s event=none integration=idle
+- worker-2 role=executor lifecycle=starting claim=none title=Lane B — Consume shared input task_status=blocked reason=blocked_by_dependency:task-1 heartbeat=15s event=none integration=idle
+
+=== heartbeat update ===
+team: headless-demo
+phase: running
+tasks: pending=2 blocked=0 in_progress=0 completed=0 failed=0
+latest event: heartbeat_observed
+workers:
+- worker-1 role=executor lifecycle=starting claim=none title=Lane A — Prepare shared input task_status=pending reason=none heartbeat=1s event=heartbeat_observed integration=idle
+- worker-2 role=executor lifecycle=starting claim=none title=Lane B — Consume shared input task_status=blocked reason=blocked_by_dependency:task-1 heartbeat=15s event=none integration=idle
+
+=== B blocked by A ===
+team: headless-demo
+phase: running
+tasks: pending=2 blocked=0 in_progress=0 completed=0 failed=0
+latest event: worker_status_updated: Worker worker-2 reported blocked
+workers:
+- worker-1 role=executor lifecycle=starting claim=none title=Lane A — Prepare shared input task_status=pending reason=none heartbeat=1s event=heartbeat_observed integration=idle
+- worker-2 role=executor lifecycle=ready claim=none title=Lane B — Consume shared input task_status=blocked reason=blocked_by_dependency:task-1 heartbeat=15s event=worker_status_updated: Worker worker-2 reported blocked integration=idle
+
+=== B progressing after A ===
+team: headless-demo
+phase: running
+tasks: pending=0 blocked=0 in_progress=1 completed=1 failed=0
+latest event: worker_status_updated: Worker worker-2 reported working
+workers:
+- worker-1 role=executor lifecycle=starting claim=none title=none task_status=none reason=none heartbeat=1s event=task_claimed: task-1: Worker claimed task integration=idle
+- worker-2 role=executor lifecycle=working claim=task-2 title=Lane B — Consume shared input task_status=in_progress reason=none heartbeat=15s event=worker_status_updated: Worker worker-2 reported working integration=idle
+
+=== B resumed and reclaimed ===
+team: headless-demo
+phase: running
+tasks: pending=0 blocked=0 in_progress=1 completed=1 failed=0
+latest event: worker_status_updated: Worker worker-2 reported working
+workers:
+- worker-1 role=executor lifecycle=ready claim=none title=none task_status=none reason=none heartbeat=1s event=task_claimed: task-1: Worker claimed task integration=idle
+- worker-2 role=executor lifecycle=working claim=task-2 title=Lane B — Consume shared input task_status=in_progress reason=none heartbeat=0s event=worker_status_updated: Worker worker-2 reported working integration=idle
+
+=== terminal complete ===
+team: headless-demo
+phase: complete
+tasks: pending=0 blocked=0 in_progress=0 completed=2 failed=0
+latest event: team_shutdown: Shut down native gjc team runtime after completed tasks
+workers:
+- worker-1 role=executor lifecycle=stopped claim=none title=none task_status=none reason=none heartbeat=1s event=worker_shutdown_requested: Worker worker-1 shutdown requested integration=idle
+- worker-2 role=executor lifecycle=stopped claim=none title=none task_status=none reason=none heartbeat=0s event=worker_shutdown_requested: Worker worker-2 shutdown requested integration=idle
+
+=== assertions ===
+PASS: two workers are visible
+PASS: heartbeat update is rendered
+PASS: dependency blocks B
+PASS: B claims after A completes
+PASS: production resume authoritatively probes the interrupted worker dead
+PASS: resume releases the dead worker claim
+PASS: resume replaces the dead worker session
+PASS: resumed worker reclaims B with a new token
+PASS: terminal phase is complete
+PASS: both tasks completed
+PASS: runtime recovery event sequence preserves dependency order

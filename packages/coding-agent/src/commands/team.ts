@@ -11,10 +11,12 @@ import {
 	persistGjcTeamModeStateSummary,
 	readGjcTeamEvents,
 	readGjcTeamSnapshot,
+	resumeGjcTeam,
 	shutdownGjcTeam,
 	startGjcTeam,
 } from "../gjc-runtime/team-runtime";
 import { syncSkillActiveState } from "../skill-state/active-state";
+import { parseTeamWatchTarget, runTeamWatch } from "./team-watch";
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -80,7 +82,7 @@ export default class Team extends Command {
 
 	static args = {
 		action: Args.string({
-			description: "start (default), status, monitor, list, shutdown, resume, or api",
+			description: "start (default), status, watch, monitor, list, shutdown, resume, or api",
 			required: false,
 		}),
 	};
@@ -92,12 +94,16 @@ export default class Team extends Command {
 				"Create ephemeral .gjc/_session-{sessionid}/state/team state without starting tmux panes; do not commit generated state",
 			default: false,
 		}),
+		plain: Flags.boolean({ description: "Stream ANSI-free watch frames", default: false }),
+		once: Flags.boolean({ description: "Emit one watch frame and exit", default: false }),
+		"interval-ms": Flags.integer({ description: "Live watch refresh interval in milliseconds", default: 1000 }),
 	};
 
 	static examples = [
 		"gjc --tmux  # start the required tmux-backed leader session first",
 		'gjc team 3:executor "Implement the approved plan"',
 		"gjc team status <team-name> --json",
+		"gjc team watch <team-name> --plain",
 		"gjc team monitor <team-name> --json",
 		'gjc team api claim-task --input \'{"team_name":"demo","worker_id":"worker-1"}\' --json',
 		'gjc team 2:executor --dry-run --json "Preview state only"',
@@ -105,10 +111,26 @@ export default class Team extends Command {
 	];
 
 	async run(): Promise<void> {
-		const { flags } = await this.parse(Team);
-		const [action = "start", ...rest] = this.argv;
+		const { args, flags } = await this.parse(Team);
+		const action = args.action ?? "start";
+		const actionIndex = this.argv.indexOf(action);
+		const rest = actionIndex >= 0 ? this.argv.slice(actionIndex + 1) : this.argv;
 		const json = flags.json ?? this.argv.includes("--json");
 		const dryRun = flags["dry-run"] ?? this.argv.includes("--dry-run");
+
+		if (action === "watch") {
+			const teamName = parseTeamWatchTarget(rest);
+			if (!teamName) throw new Error("missing_team_name");
+			const intervalMs = flags["interval-ms"] ?? 1000;
+			if (!Number.isFinite(intervalMs) || intervalMs < 50) throw new Error("invalid_interval_ms");
+			await runTeamWatch(teamName, {
+				json,
+				plain: flags.plain ?? this.argv.includes("--plain"),
+				once: flags.once ?? this.argv.includes("--once"),
+				intervalMs,
+			});
+			return;
+		}
 
 		if (action === "list") {
 			const teams = await listGjcTeams();
@@ -139,7 +161,7 @@ export default class Team extends Command {
 		if (action === "monitor" || action === "resume") {
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
-			const snapshot = await monitorGjcTeamSnapshot(teamName);
+			const snapshot = action === "resume" ? await resumeGjcTeam(teamName) : await monitorGjcTeamSnapshot(teamName);
 			await syncTeamHud(snapshot);
 			if (json) {
 				writeReceipt(snapshotWriteReceipt(snapshot));
